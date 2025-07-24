@@ -1,28 +1,12 @@
-//! # Solana TPU Client Next
+//! # Feature flags
 //! 
-//! Client code to send transactions to TPU (Transaction Processing Unit).
+//! Tpu-client-next supports three features:
 //! 
-//! ## Logging Features
-//! 
-//! This crate supports two mutually exclusive logging backends:
-//! 
-//! - **`log` feature**: Uses the `log` crate for logging (default)
-//! - **`tracing` feature**: Uses the `tracing` crate for logging
-//! 
-//! By default, the crate uses the `log` feature. To use `tracing` instead:
-//! 
-//! ```toml
-//! # Default behavior (uses log crate)
-//! solana-tpu-client-next = "3.0.0"
-//! 
-//! # Explicitly specify log crate
-//! solana-tpu-client-next = { version = "3.0.0", features = ["log"] }
-//! 
-//! # Use tracing crate instead
-//! solana-tpu-client-next = { version = "3.0.0", default-features = false, features = ["tracing"] }
-//! ```
-//! 
-//! The features are mutually exclusive to prevent conflicts between the two logging systems.
+//! - **`metrics`**: Enables implementation of the method `report_to_influxdb` for 
+//!   [`SendTransactionStats`] structure.
+//! - **`log`**: Enables logging using `log` crate. It is enabled by default.
+//! - **`tracing`**: Enables logging using `tracing` crate instead of `log`. This feature is 
+//!   mutually exclusive with `log`.
 
 pub(crate) mod connection_worker;
 pub mod connection_workers_scheduler;
