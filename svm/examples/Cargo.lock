@@ -898,9 +898,9 @@ dependencies = [
 
 [[package]]
 name = "bytemuck_derive"
-version = "1.9.3"
+version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ecc273b49b3205b83d648f0690daa588925572cc5063745bfe547fe7ec8e1a1"
+checksum = "441473f2b4b0459a68628c744bc61d23e730fb00128b841d30fa4bb3972257e4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2800,9 +2800,9 @@ dependencies = [
 
 [[package]]
 name = "io-uring"
-version = "0.7.8"
+version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b86e202f00093dcba4275d4636b93ef9dd75d025ae560d2521b45ea28ab49013"
+checksum = "d93587f37623a1a17d94ef2bc9ada592f5465fe7732084ab7beefabe5c77c0c4"
 dependencies = [
  "bitflags 2.9.1",
  "cfg-if 1.0.0",
@@ -4952,9 +4952,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.140"
+version = "1.0.141"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20068b6e96dc6c9bd23e01df8827e6c7e1f2fddd43c21810382803c136b99373"
+checksum = "30b9eff21ebe718216c6ec64e1d9ac57087aad11efc64e32002bce4a0d4c03d3"
 dependencies = [
  "itoa",
  "memchr",
@@ -5922,6 +5922,7 @@ dependencies = [
  "log",
  "lru",
  "min-max-heap",
+ "num_cpus",
  "num_enum",
  "prio-graph",
  "qualifier_attr",
@@ -6141,6 +6142,7 @@ dependencies = [
  "crossbeam-channel",
  "dlopen2",
  "log",
+ "num_cpus",
  "rand 0.8.5",
  "rayon",
  "serde",
@@ -6150,7 +6152,6 @@ dependencies = [
  "solana-metrics",
  "solana-packet",
  "solana-perf",
- "solana-rayon-threadlimit",
  "solana-runtime-transaction",
  "solana-sha256-hasher",
  "solana-transaction",
@@ -7336,6 +7337,7 @@ dependencies = [
 name = "solana-rayon-threadlimit"
 version = "3.0.0"
 dependencies = [
+ "log",
  "num_cpus",
 ]
 

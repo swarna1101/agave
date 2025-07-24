@@ -75,18 +75,13 @@ use {
         account_locks::validate_account_locks,
         accounts::{AccountAddressFilter, Accounts, PubkeyAccountSlot},
         accounts_db::{
-            AccountStorageEntry, AccountsDb, AccountsDbConfig, CalcAccountsHashDataSource,
-            DuplicatesLtHash, PubkeyHashAccount,
+            AccountStorageEntry, AccountsDb, AccountsDbConfig, DuplicatesLtHash, PubkeyHashAccount,
         },
-        accounts_hash::{
-            AccountsHash, AccountsLtHash, CalcAccountsHashConfig, HashStats,
-            IncrementalAccountsHash, MerkleOrLatticeAccountsHash,
-        },
+        accounts_hash::{AccountsHash, AccountsLtHash, IncrementalAccountsHash},
         accounts_index::{IndexKey, ScanConfig, ScanResult},
         accounts_update_notifier_interface::AccountsUpdateNotifier,
         ancestors::{Ancestors, AncestorsForSerialization},
         blockhash_queue::BlockhashQueue,
-        sorted_storages::SortedStorages,
         storable_accounts::StorableAccounts,
     },
     solana_bpf_loader_program::syscalls::{
@@ -99,7 +94,7 @@ use {
     },
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions,
-    solana_cost_model::{block_cost_limits::simd_0256_block_limits, cost_tracker::CostTracker},
+    solana_cost_model::cost_tracker::CostTracker,
     solana_epoch_info::EpochInfo,
     solana_epoch_schedule::EpochSchedule,
     solana_feature_gate_interface as feature,
@@ -127,7 +122,7 @@ use {
         runtime_transaction::RuntimeTransaction, transaction_with_meta::TransactionWithMeta,
     },
     solana_sdk_ids::{bpf_loader_upgradeable, incinerator, native_loader},
-    solana_sha256_hasher::{extend_and_hash, hashv},
+    solana_sha256_hasher::hashv,
     solana_signature::Signature,
     solana_slot_hashes::SlotHashes,
     solana_slot_history::{Check, SlotHistory},
@@ -247,7 +242,7 @@ impl AddAssign for SquashTiming {
     }
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CollectorFeeDetails {
     transaction_fee: u64,
     priority_fee: u64,
@@ -263,8 +258,12 @@ impl CollectorFeeDetails {
             .saturating_add(fee_details.prioritization_fee());
     }
 
-    pub(crate) fn total(&self) -> u64 {
+    pub fn total_transaction_fee(&self) -> u64 {
         self.transaction_fee.saturating_add(self.priority_fee)
+    }
+
+    pub fn total_priority_fee(&self) -> u64 {
+        self.priority_fee
     }
 }
 
@@ -403,7 +402,7 @@ impl TransactionLogCollector {
 /// Since it is difficult to insert fields to serialize/deserialize against existing code already deployed,
 /// new fields can be optionally serialized and optionally deserialized. At some point, the serialization and
 /// deserialization will use a new mechanism or otherwise be in sync more clearly.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "dev-context-only-utils", derive(PartialEq))]
 pub struct BankFieldsToDeserialize {
     pub(crate) blockhash_queue: BlockhashQueue,
@@ -436,8 +435,7 @@ pub struct BankFieldsToDeserialize {
     pub(crate) is_delta: bool,
     pub(crate) accounts_data_len: u64,
     pub(crate) incremental_snapshot_persistence: Option<BankIncrementalSnapshotPersistence>,
-    // When removing the accounts lt hash featurization code, also remove this Option wrapper
-    pub(crate) accounts_lt_hash: Option<AccountsLtHash>,
+    pub(crate) accounts_lt_hash: AccountsLtHash,
     pub(crate) bank_hash_stats: BankHashStats,
 }
 
@@ -1804,11 +1802,7 @@ impl Bank {
             fee_structure: FeeStructure::default(),
             #[cfg(feature = "dev-context-only-utils")]
             hash_overrides: Arc::new(Mutex::new(HashOverrides::default())),
-            accounts_lt_hash: Mutex::new(
-                fields
-                    .accounts_lt_hash
-                    .expect("accounts_lt_hash must exist in snapshot"),
-            ),
+            accounts_lt_hash: Mutex::new(fields.accounts_lt_hash),
             cache_for_accounts_lt_hash: DashMap::default(),
             stats_for_accounts_lt_hash: AccountsLtHashStats::default(),
             block_id: RwLock::new(None),
@@ -4050,22 +4044,6 @@ impl Bank {
             debug_do_not_add_builtins,
         );
 
-        // Cost-Tracker is not serialized in snapshot or any configs.
-        // We must apply previously activated features related to limits here
-        // so that the initial bank state is consistent with the feature set.
-        // Cost-tracker limits are propagated through children banks.
-        if self
-            .feature_set
-            .is_active(&feature_set::raise_block_limits_to_60m::id())
-        {
-            let (account_cost_limit, block_cost_limit, vote_cost_limit) = simd_0256_block_limits();
-            self.write_cost_tracker().unwrap().set_limits(
-                account_cost_limit,
-                block_cost_limit,
-                vote_cost_limit,
-            );
-        }
-
         if !debug_do_not_add_builtins {
             for builtin in BUILTINS
                 .iter()
@@ -4455,7 +4433,7 @@ impl Bank {
             .unwrap()
             .get_hash_data(slot, self.parent_slot());
         if let Some(buf) = buf {
-            let hard_forked_hash = extend_and_hash(&hash, &buf);
+            let hard_forked_hash = hashv(&[hash.as_ref(), &buf]);
             warn!("hard fork at slot {slot} by hashing {buf:?}: {hash} => {hard_forked_hash}");
             hash = hard_forked_hash;
         }
@@ -4809,10 +4787,7 @@ impl Bank {
     ///
     /// This fn is used at startup to verify the bank was rebuilt correctly.
     pub fn get_snapshot_hash(&self) -> SnapshotHash {
-        SnapshotHash::new(
-            &MerkleOrLatticeAccountsHash::Lattice,
-            Some(self.accounts_lt_hash.lock().unwrap().0.checksum()),
-        )
+        SnapshotHash::new(Some(self.accounts_lt_hash.lock().unwrap().0.checksum()))
     }
 
     pub fn load_account_into_read_cache(&self, key: &Pubkey) {
@@ -4820,81 +4795,6 @@ impl Bank {
             .accounts
             .accounts_db
             .load_account_into_read_cache(&self.ancestors, key);
-    }
-
-    pub fn update_accounts_hash(
-        &self,
-        data_source: CalcAccountsHashDataSource,
-        is_startup: bool,
-    ) -> AccountsHash {
-        let (accounts_hash, total_lamports) = self
-            .rc
-            .accounts
-            .accounts_db
-            .update_accounts_hash_with_verify_from(
-                data_source,
-                false, // debug_verify
-                self.slot(),
-                &self.ancestors,
-                Some(self.capitalization()),
-                self.epoch_schedule(),
-                is_startup,
-            );
-        if total_lamports != self.capitalization() {
-            datapoint_info!(
-                "capitalization_mismatch",
-                ("slot", self.slot(), i64),
-                ("calculated_lamports", total_lamports, i64),
-                ("capitalization", self.capitalization(), i64),
-            );
-
-            // cap mismatch detected. It has been logged to metrics above.
-            // Run both versions of the calculation to attempt to get more info.
-            let debug_verify = true;
-            self.rc
-                .accounts
-                .accounts_db
-                .update_accounts_hash_with_verify_from(
-                    data_source,
-                    debug_verify,
-                    self.slot(),
-                    &self.ancestors,
-                    Some(self.capitalization()),
-                    self.epoch_schedule(),
-                    is_startup,
-                );
-
-            panic!(
-                "capitalization_mismatch. slot: {}, calculated_lamports: {}, capitalization: {}",
-                self.slot(),
-                total_lamports,
-                self.capitalization()
-            );
-        }
-        accounts_hash
-    }
-
-    /// Calculate the incremental accounts hash from `base_slot` to `self`
-    pub fn update_incremental_accounts_hash(&self, base_slot: Slot) -> IncrementalAccountsHash {
-        let config = CalcAccountsHashConfig {
-            use_bg_thread_pool: true,
-            ancestors: None, // does not matter, will not be used
-            epoch_schedule: &self.epoch_schedule,
-            epoch: self.epoch,
-            store_detailed_debug_info_on_failure: false,
-        };
-        let storages = self.get_snapshot_storages(Some(base_slot));
-        let sorted_storages = SortedStorages::new(&storages);
-        self.rc
-            .accounts
-            .accounts_db
-            .update_incremental_accounts_hash(
-                &config,
-                &sorted_storages,
-                self.slot(),
-                HashStats::default(),
-            )
-            .0
     }
 
     /// A snapshot bank should be purged of 0 lamport accounts which are not part of the hash
@@ -5421,15 +5321,6 @@ impl Bank {
                 &new_feature_activations,
             );
         }
-
-        if new_feature_activations.contains(&feature_set::raise_block_limits_to_60m::id()) {
-            let (account_cost_limit, block_cost_limit, vote_cost_limit) = simd_0256_block_limits();
-            self.write_cost_tracker().unwrap().set_limits(
-                account_cost_limit,
-                block_cost_limit,
-                vote_cost_limit,
-            );
-        }
     }
 
     fn adjust_sysvar_balance_for_rent(&self, account: &mut AccountSharedData) {
@@ -5688,6 +5579,11 @@ impl Bank {
     /// Sets the accounts lt hash, only to be used by SnapshotMinimizer
     pub fn set_accounts_lt_hash_for_snapshot_minimizer(&self, accounts_lt_hash: AccountsLtHash) {
         *self.accounts_lt_hash.lock().unwrap() = accounts_lt_hash;
+    }
+
+    /// Return total transaction fee collected
+    pub fn get_collector_fee_details(&self) -> CollectorFeeDetails {
+        self.collector_fee_details.read().unwrap().clone()
     }
 }
 
@@ -5977,8 +5873,11 @@ impl Bank {
         self.transaction_processor.get_sysvar_cache_for_tests()
     }
 
-    pub fn update_accounts_hash_for_tests(&self) -> AccountsHash {
-        self.update_accounts_hash(CalcAccountsHashDataSource::IndexForTests, false)
+    pub fn calculate_accounts_lt_hash_for_tests(&self) -> AccountsLtHash {
+        self.rc
+            .accounts
+            .accounts_db
+            .calculate_accounts_lt_hash_at_startup_from_index(&self.ancestors, self.slot)
     }
 
     pub fn new_program_cache_for_tx_batch_for_slot(&self, slot: Slot) -> ProgramCacheForTxBatch {

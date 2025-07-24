@@ -2,9 +2,8 @@ use {
     crate::{
         bank::{BankFieldsToDeserialize, BankFieldsToSerialize, BankHashStats, BankSlotDelta},
         serde_snapshot::{
-            self, AccountsDbFields, BankIncrementalSnapshotPersistence, ExtraFieldsToSerialize,
-            SerializableAccountStorageEntry, SnapshotAccountsDbFields, SnapshotBankFields,
-            SnapshotStreams,
+            self, AccountsDbFields, ExtraFieldsToSerialize, SerializableAccountStorageEntry,
+            SnapshotAccountsDbFields, SnapshotBankFields, SnapshotStreams,
         },
         snapshot_archive_info::{
             FullSnapshotArchiveInfo, IncrementalSnapshotArchiveInfo, SnapshotArchiveInfo,
@@ -26,7 +25,7 @@ use {
         account_storage_reader::AccountStorageReader,
         accounts_db::{AccountStorageEntry, AtomicAccountsFileId},
         accounts_file::{AccountsFile, AccountsFileError, StorageAccess},
-        accounts_hash::{AccountsDeltaHash, AccountsHash},
+        accounts_hash::AccountsHash,
         hardened_unpack::{self, ArchiveChunker, BytesChannelReader, MultiBytes, UnpackError},
         utils::{move_and_async_delete_path, ACCOUNTS_RUN_DIR, ACCOUNTS_SNAPSHOT_DIR},
     },
@@ -829,9 +828,7 @@ pub fn serialize_and_archive_snapshot_package(
         status_cache_slot_deltas,
         bank_fields_to_serialize,
         bank_hash_stats,
-        accounts_delta_hash,
         accounts_hash,
-        bank_incremental_snapshot_persistence,
         write_version,
         enqueued: _,
     } = snapshot_package;
@@ -843,9 +840,7 @@ pub fn serialize_and_archive_snapshot_package(
         status_cache_slot_deltas.as_slice(),
         bank_fields_to_serialize,
         bank_hash_stats,
-        accounts_delta_hash,
         accounts_hash,
-        bank_incremental_snapshot_persistence.as_ref(),
         write_version,
         should_flush_and_hard_link_storages,
     )?;
@@ -905,9 +900,7 @@ fn serialize_snapshot(
     slot_deltas: &[BankSlotDelta],
     mut bank_fields: BankFieldsToSerialize,
     bank_hash_stats: BankHashStats,
-    accounts_delta_hash: AccountsDeltaHash,
     accounts_hash: AccountsHash,
-    bank_incremental_snapshot_persistence: Option<&BankIncrementalSnapshotPersistence>,
     write_version: u64,
     should_flush_and_hard_link_storages: bool,
 ) -> Result<BankSnapshotInfo> {
@@ -960,7 +953,7 @@ fn serialize_snapshot(
             let versioned_epoch_stakes = mem::take(&mut bank_fields.versioned_epoch_stakes);
             let extra_fields = ExtraFieldsToSerialize {
                 lamports_per_signature: bank_fields.fee_rate_governor.lamports_per_signature,
-                incremental_snapshot_persistence: bank_incremental_snapshot_persistence,
+                incremental_snapshot_persistence: None,
                 obsolete_epoch_accounts_hash: None,
                 versioned_epoch_stakes,
                 accounts_lt_hash: Some(bank_fields.accounts_lt_hash.clone().into()),
@@ -969,7 +962,6 @@ fn serialize_snapshot(
                 stream,
                 bank_fields,
                 bank_hash_stats,
-                accounts_delta_hash,
                 accounts_hash,
                 &get_storages_to_serialize(snapshot_storages),
                 extra_fields,

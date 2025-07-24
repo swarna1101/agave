@@ -83,7 +83,7 @@ use {
         transaction_recorder::TransactionRecorder,
     },
     solana_pubkey::Pubkey,
-    solana_rayon_threadlimit::{get_max_thread_count, get_thread_count},
+    solana_rayon_threadlimit::get_thread_count,
     solana_rpc::{
         max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::{
@@ -299,8 +299,11 @@ pub struct ValidatorConfig {
     pub repair_handler_type: RepairHandlerType,
 }
 
-impl Default for ValidatorConfig {
-    fn default() -> Self {
+impl ValidatorConfig {
+    pub fn default_for_test() -> Self {
+        let max_thread_count =
+            NonZeroUsize::new(num_cpus::get()).expect("thread count is non-zero");
+
         Self {
             halt_at_slot: None,
             expected_genesis_hash: None,
@@ -308,10 +311,10 @@ impl Default for ValidatorConfig {
             expected_shred_version: None,
             voting_disabled: false,
             max_ledger_shreds: None,
-            blockstore_options: BlockstoreOptions::default(),
+            blockstore_options: BlockstoreOptions::default_for_tests(),
             account_paths: Vec::new(),
             account_snapshot_paths: Vec::new(),
-            rpc_config: JsonRpcConfig::default(),
+            rpc_config: JsonRpcConfig::default_for_test(),
             on_start_geyser_plugin_config_files: None,
             geyser_plugin_always_enabled: false,
             rpc_addrs: None,
@@ -350,49 +353,30 @@ impl Default for ValidatorConfig {
             validator_exit: Arc::new(RwLock::new(Exit::default())),
             validator_exit_backpressure: HashMap::default(),
             no_wait_for_vote_to_start_leader: true,
-            accounts_db_config: None,
+            accounts_db_config: Some(ACCOUNTS_DB_CONFIG_FOR_TESTING),
             wait_to_vote_slot: None,
             runtime_config: RuntimeConfig::default(),
             banking_trace_dir_byte_limit: 0,
             block_verification_method: BlockVerificationMethod::default(),
             block_production_method: BlockProductionMethod::default(),
             transaction_struct: TransactionStructure::default(),
-            enable_block_production_forwarding: false,
+            // enable forwarding by default for tests
+            enable_block_production_forwarding: true,
             generator_config: None,
             use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup::default(),
             wen_restart_proto_path: None,
             wen_restart_coordinator: None,
             unified_scheduler_handler_threads: None,
             ip_echo_server_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
-            rayon_global_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
-            replay_forks_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
-            replay_transactions_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
-            tvu_shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
-            delay_leader_block_for_pending_fork: false,
-            use_tpu_client_next: true,
-            retransmit_xdp: None,
-            repair_handler_type: RepairHandlerType::default(),
-        }
-    }
-}
-
-impl ValidatorConfig {
-    pub fn default_for_test() -> Self {
-        let max_thread_count =
-            NonZeroUsize::new(get_max_thread_count()).expect("thread count is non-zero");
-
-        Self {
-            accounts_db_config: Some(ACCOUNTS_DB_CONFIG_FOR_TESTING),
-            blockstore_options: BlockstoreOptions::default_for_tests(),
-            rpc_config: JsonRpcConfig::default_for_test(),
-            block_production_method: BlockProductionMethod::default(),
-            enable_block_production_forwarding: true, // enable forwarding by default for tests
             rayon_global_threads: max_thread_count,
             replay_forks_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             replay_transactions_threads: max_thread_count,
             tvu_shred_sigverify_threads: NonZeroUsize::new(get_thread_count())
                 .expect("thread count is non-zero"),
-            ..Self::default()
+            delay_leader_block_for_pending_fork: false,
+            use_tpu_client_next: true,
+            retransmit_xdp: None,
+            repair_handler_type: RepairHandlerType::default(),
         }
     }
 
@@ -1063,17 +1047,6 @@ impl Validator {
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
 
-        let rpc_subscriptions = Arc::new(RpcSubscriptions::new_with_config(
-            exit.clone(),
-            max_complete_transaction_status_slot.clone(),
-            blockstore.clone(),
-            bank_forks.clone(),
-            block_commitment_cache.clone(),
-            optimistically_confirmed_bank.clone(),
-            &config.pubsub_config,
-            None,
-        ));
-
         let max_slots = Arc::new(MaxSlots::default());
 
         let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
@@ -1152,6 +1125,7 @@ impl Validator {
             Arc::new(AtomicBool::new(config.rpc_config.disable_health_check));
         let (
             json_rpc_service,
+            rpc_subscriptions,
             pubsub_service,
             completed_data_sets_sender,
             completed_data_sets_service,
@@ -1208,13 +1182,22 @@ impl Validator {
                 send_transaction_service_config: config.send_transaction_service_config.clone(),
                 max_slots: max_slots.clone(),
                 leader_schedule_cache: leader_schedule_cache.clone(),
-                max_complete_transaction_status_slot,
+                max_complete_transaction_status_slot: max_complete_transaction_status_slot.clone(),
                 prioritization_fee_cache: prioritization_fee_cache.clone(),
                 client_option,
             };
             let json_rpc_service =
                 JsonRpcService::new_with_config(rpc_svc_config).map_err(ValidatorError::Other)?;
-
+            let rpc_subscriptions = Arc::new(RpcSubscriptions::new_with_config(
+                exit.clone(),
+                max_complete_transaction_status_slot,
+                blockstore.clone(),
+                bank_forks.clone(),
+                block_commitment_cache.clone(),
+                optimistically_confirmed_bank.clone(),
+                &config.pubsub_config,
+                None,
+            ));
             let pubsub_service = if !config.rpc_config.full_api {
                 None
             } else {
@@ -1283,6 +1266,7 @@ impl Validator {
             });
             (
                 Some(json_rpc_service),
+                Some(rpc_subscriptions),
                 pubsub_service,
                 completed_data_sets_sender,
                 completed_data_sets_service,
@@ -1291,7 +1275,7 @@ impl Validator {
                 bank_notification_sender_config,
             )
         } else {
-            (None, None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None)
         };
 
         if config.halt_at_slot.is_some() {
@@ -1522,7 +1506,7 @@ impl Validator {
             },
             blockstore.clone(),
             ledger_signal_receiver,
-            &rpc_subscriptions,
+            rpc_subscriptions.clone(),
             &poh_recorder,
             tower,
             config.tower_storage.clone(),
@@ -1627,7 +1611,7 @@ impl Validator {
                 vote_forwarding_client: node.sockets.tpu_vote_forwarding_client,
                 vortexor_receivers: node.sockets.vortexor_receivers,
             },
-            &rpc_subscriptions,
+            rpc_subscriptions.clone(),
             transaction_status_sender,
             entry_notification_sender,
             blockstore.clone(),
