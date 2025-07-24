@@ -6,17 +6,20 @@
 //! 
 //! This crate supports two mutually exclusive logging backends:
 //! 
-//! - **`log` feature**: Uses the `log` crate for logging (default in most Solana projects)
+//! - **`log` feature**: Uses the `log` crate for logging (default)
 //! - **`tracing` feature**: Uses the `tracing` crate for logging
 //! 
-//! You must enable exactly one of these features when using this crate:
+//! By default, the crate uses the `log` feature. To use `tracing` instead:
 //! 
 //! ```toml
-//! # For log crate (default in Solana ecosystem)
+//! # Default behavior (uses log crate)
+//! solana-tpu-client-next = "3.0.0"
+//! 
+//! # Explicitly specify log crate
 //! solana-tpu-client-next = { version = "3.0.0", features = ["log"] }
 //! 
-//! # For tracing crate
-//! solana-tpu-client-next = { version = "3.0.0", features = ["tracing"] }
+//! # Use tracing crate instead
+//! solana-tpu-client-next = { version = "3.0.0", default-features = false, features = ["tracing"] }
 //! ```
 //! 
 //! The features are mutually exclusive to prevent conflicts between the two logging systems.
