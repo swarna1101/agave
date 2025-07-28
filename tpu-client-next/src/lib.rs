@@ -1,11 +1,11 @@
 //! # Feature flags
-//! 
+//!
 //! Tpu-client-next supports three features:
-//! 
-//! - **`metrics`**: Enables implementation of the method `report_to_influxdb` for 
+//!
+//! - **`metrics`**: Enables implementation of the method `report_to_influxdb` for
 //!   [`SendTransactionStats`] structure.
 //! - **`log`**: Enables logging using `log` crate. It is enabled by default.
-//! - **`tracing`**: Enables logging using `tracing` crate instead of `log`. This feature is 
+//! - **`tracing`**: Enables logging using `tracing` crate instead of `log`. This feature is
 //!   mutually exclusive with `log`.
 
 pub(crate) mod connection_worker;
