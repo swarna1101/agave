@@ -11,7 +11,7 @@ use {
     log::*,
     rand::{seq::SliceRandom, thread_rng},
     solana_accounts_db::{
-        accounts_db::{AccountShrinkThreshold, AccountsDb, AccountsDbConfig},
+        accounts_db::{AccountShrinkThreshold, AccountsDbConfig},
         accounts_file::StorageAccess,
         accounts_index::{
             AccountIndex, AccountSecondaryIndexes, AccountSecondaryIndexesIncludeExclude,
@@ -64,10 +64,7 @@ use {
     },
     solana_send_transaction_service::send_transaction_service,
     solana_signer::Signer,
-    solana_streamer::{
-        quic::{QuicServerParams, DEFAULT_TPU_COALESCE},
-        socket::SocketAddrSpace,
-    },
+    solana_streamer::quic::{QuicServerParams, DEFAULT_TPU_COALESCE},
     solana_tpu_client::tpu_client::DEFAULT_TPU_ENABLE_UDP,
     solana_turbine::{
         broadcast_stage::BroadcastStageType,
@@ -98,7 +95,6 @@ const MILLIS_PER_SECOND: u64 = 1000;
 pub fn execute(
     matches: &ArgMatches,
     solana_version: &str,
-    socket_addr_space: SocketAddrSpace,
     ledger_path: &Path,
     operation: Operation,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -199,18 +195,6 @@ pub fn execute(
         None
     };
 
-    let accounts_hash_cache_path = matches
-        .value_of("accounts_hash_cache_path")
-        .map(Into::into)
-        .unwrap_or_else(|| ledger_path.join(AccountsDb::DEFAULT_ACCOUNTS_HASH_CACHE_DIR));
-    let accounts_hash_cache_path = create_and_canonicalize_directory(&accounts_hash_cache_path)
-        .map_err(|err| {
-            format!(
-                "Unable to access accounts hash cache path '{}': {err}",
-                accounts_hash_cache_path.display(),
-            )
-        })?;
-
     let debug_keys: Option<Arc<HashSet<_>>> = if matches.is_present("debug_key") {
         Some(Arc::new(
             values_t_or_exit!(matches, "debug_key", Pubkey)
@@ -296,7 +280,7 @@ pub fn execute(
     };
     let entrypoint_addrs = run_args.entrypoints;
     for addr in &entrypoint_addrs {
-        if !socket_addr_space.check(addr) {
+        if !run_args.socket_addr_space.check(addr) {
             Err(format!("invalid entrypoint address: {addr}"))?;
         }
     }
@@ -413,7 +397,6 @@ pub fn execute(
         index: Some(accounts_index_config),
         account_indexes: Some(account_indexes.clone()),
         base_working_path: Some(ledger_path.clone()),
-        accounts_hash_cache_path: Some(accounts_hash_cache_path),
         shrink_paths: account_shrink_run_paths,
         shrink_ratio,
         read_cache_limit_bytes,
@@ -428,12 +411,6 @@ pub fn execute(
         )
         .ok(),
         max_ancient_storages: value_t!(matches, "accounts_db_max_ancient_storages", usize).ok(),
-        hash_calculation_pubkey_bins: value_t!(
-            matches,
-            "accounts_db_hash_calculation_pubkey_bins",
-            usize
-        )
-        .ok(),
         exhaustively_verify_refcounts: matches.is_present("accounts_db_verify_refcounts"),
         storage_access,
         scan_filter_for_shrinking,
@@ -1032,7 +1009,7 @@ pub fn execute(
             &start_progress,
             minimal_snapshot_download_speed,
             maximum_snapshot_download_abort,
-            socket_addr_space,
+            run_args.socket_addr_space,
         );
         *start_progress.write().unwrap() = ValidatorStartProgress::Initializing;
     }
@@ -1089,7 +1066,7 @@ pub fn execute(
         should_check_duplicate_instance,
         rpc_to_plugin_manager_receiver,
         start_progress,
-        socket_addr_space,
+        run_args.socket_addr_space,
         ValidatorTpuConfig {
             use_quic: tpu_use_quic,
             vote_use_quic,

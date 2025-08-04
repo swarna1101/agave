@@ -46,7 +46,7 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_rpc::{
-        optimistically_confirmed_bank_tracker::BankNotificationSender,
+        optimistically_confirmed_bank_tracker::BankNotificationSenderConfig,
         rpc_subscriptions::RpcSubscriptions,
     },
     solana_runtime::{
@@ -140,7 +140,7 @@ impl Tpu {
         gossip_verified_vote_hash_sender: GossipVerifiedVoteHashSender,
         replay_vote_receiver: ReplayVoteReceiver,
         replay_vote_sender: ReplayVoteSender,
-        bank_notification_sender: Option<BankNotificationSender>,
+        bank_notification_sender: Option<BankNotificationSenderConfig>,
         tpu_coalesce: Duration,
         duplicate_confirmed_slot_sender: DuplicateConfirmedSlotsSender,
         client: ForwardingClientOption,
@@ -327,7 +327,6 @@ impl Tpu {
         let banking_stage = BankingStage::new(
             block_production_method,
             transaction_struct,
-            cluster_info,
             poh_recorder,
             transaction_recorder,
             non_vote_receiver,

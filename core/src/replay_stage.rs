@@ -3283,9 +3283,16 @@ impl ReplayStage {
                     );
                 }
                 if let Some(sender) = bank_notification_sender {
+                    let dependency_work = sender
+                        .dependency_tracker
+                        .as_ref()
+                        .map(|s| s.get_current_declared_work());
                     sender
                         .sender
-                        .send(BankNotification::Frozen(bank.clone_without_scheduler()))
+                        .send((
+                            BankNotification::Frozen(bank.clone_without_scheduler()),
+                            dependency_work,
+                        ))
                         .unwrap_or_else(|err| warn!("bank_notification_sender failed: {err:?}"));
                 }
 
@@ -4048,15 +4055,19 @@ impl ReplayStage {
             rpc_subscriptions.notify_roots(rooted_slots);
         }
         if let Some(sender) = bank_notification_sender {
+            let dependency_work = sender
+                .dependency_tracker
+                .as_ref()
+                .map(|s| s.get_current_declared_work());
             sender
                 .sender
-                .send(BankNotification::NewRootBank(root_bank))
+                .send((BankNotification::NewRootBank(root_bank), dependency_work))
                 .unwrap_or_else(|err| warn!("bank_notification_sender failed: {err:?}"));
 
             if let Some(new_chain) = rooted_slots_with_parents {
                 sender
                     .sender
-                    .send(BankNotification::NewRootedChain(new_chain))
+                    .send((BankNotification::NewRootedChain(new_chain), dependency_work))
                     .unwrap_or_else(|err| warn!("bank_notification_sender failed: {err:?}"));
             }
         }
@@ -4341,7 +4352,7 @@ pub(crate) mod tests {
             create_new_tmp_ledger,
             genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
             get_tmp_ledger_path, get_tmp_ledger_path_auto_delete,
-            shred::{Shred, ShredFlags, LEGACY_SHRED_DATA_CAPACITY},
+            shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
         },
         solana_poh_config::PohConfig,
         solana_rpc::{
@@ -4803,7 +4814,6 @@ pub(crate) mod tests {
                 slot.saturating_sub(1), // parent_slot
                 false,                  // is_full_slot
                 0,                      // version
-                true,                   // merkle_variant
             )
         });
 
@@ -4840,7 +4850,6 @@ pub(crate) mod tests {
                 slot.saturating_sub(1), // parent_slot
                 false,                  // is_full_slot
                 0,                      // version
-                true,                   // merkle_variant
             )
         });
 
@@ -4866,7 +4875,6 @@ pub(crate) mod tests {
                 slot.saturating_sub(1),
                 false,
                 0,
-                true, // merkle_variant
             )
         });
 
@@ -4891,7 +4899,6 @@ pub(crate) mod tests {
                 slot.saturating_sub(1),
                 false,
                 0,
-                true, // merkle_variant
             )
         });
 
@@ -4912,7 +4919,6 @@ pub(crate) mod tests {
                 slot.saturating_sub(1),
                 true,
                 0,
-                true, // merkle_variant
             )
         });
 
@@ -4935,7 +4941,6 @@ pub(crate) mod tests {
                 slot.saturating_sub(1),
                 false,
                 0,
-                true, // merkle_variant
             )
         });
 
@@ -4965,7 +4970,6 @@ pub(crate) mod tests {
                 slot.saturating_sub(1), // parent_slot
                 true,                   // is_full_slot
                 0,                      // version
-                true,                   // merkle_variant
             )
         });
 
@@ -4980,19 +4984,25 @@ pub(crate) mod tests {
     fn test_dead_fork_entry_deserialize_failure() {
         // Insert entry that causes deserialization failure
         let res = check_dead_fork(|_, bank| {
-            let gibberish = [0xa5u8; LEGACY_SHRED_DATA_CAPACITY];
-            let parent_offset = bank.slot() - bank.parent_slot();
-            let shred = Shred::new_from_data(
-                bank.slot(),
-                0, // index,
-                parent_offset as u16,
-                &gibberish,
-                ShredFlags::DATA_COMPLETE_SHRED,
-                0, // reference_tick
-                0, // version
-                0, // fec_set_index
-            );
-            vec![shred]
+            let gibberish = [0xa5u8; 1024];
+
+            let shredder = Shredder::new(bank.slot(), bank.parent_slot(), 0, 0).unwrap();
+            let keypair = Keypair::new();
+            let reed_solomon_cache = ReedSolomonCache::default();
+
+            shredder
+                .make_shreds_from_data_slice(
+                    &keypair,
+                    &gibberish,
+                    true,
+                    Some(Hash::default()),
+                    0,
+                    0,
+                    &reed_solomon_cache,
+                    &mut ProcessShredsStats::default(),
+                )
+                .unwrap()
+                .collect()
         });
 
         assert_matches!(
