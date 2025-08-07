@@ -6,7 +6,6 @@
 
 #[cfg(feature = "log")]
 pub use log::{debug, error, trace, warn};
-
 #[cfg(feature = "tracing")]
 pub use tracing::{debug, error, trace, warn};
 
