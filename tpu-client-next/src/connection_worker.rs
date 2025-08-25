@@ -138,7 +138,10 @@ impl ConnectionWorker {
                     }
                     ConnectionState::Active(connection) => {
                         let Some(transactions) = self.transactions_receiver.recv().await else {
-                            debug!("Transactions sender has been dropped for peer: {}", self.peer);
+                            debug!(
+                                "Transactions sender has been dropped for peer: {}",
+                                self.peer
+                            );
                             self.connection = ConnectionState::Closing;
                             continue;
                         };
@@ -186,7 +189,10 @@ impl ConnectionWorker {
             let result = send_data_over_stream(&connection, &data).await;
 
             if let Err(error) = result {
-                trace!("Failed to send transaction to {} over stream with error: {error}", self.peer);
+                trace!(
+                    "Failed to send transaction to {} over stream with error: {error}",
+                    self.peer
+                );
                 record_error(error, &self.send_txs_stats);
                 self.connection = ConnectionState::Retry(0);
             } else {
@@ -244,7 +250,10 @@ impl ConnectionWorker {
                 record_error(connecting_error.clone().into(), &self.send_txs_stats);
                 match connecting_error {
                     ConnectError::EndpointStopping => {
-                        debug!("Endpoint stopping, exit connection worker for peer: {}", self.peer);
+                        debug!(
+                            "Endpoint stopping, exit connection worker for peer: {}",
+                            self.peer
+                        );
                         self.connection = ConnectionState::Closing;
                     }
                     ConnectError::InvalidRemoteAddress(_) => {
@@ -262,7 +271,10 @@ impl ConnectionWorker {
 
     /// Attempts to reconnect to the peer after a connection failure.
     async fn reconnect(&mut self, num_reconnects: usize) {
-        debug!("Trying to reconnect to {}. Reopen connection, 0rtt is not implemented yet.", self.peer);
+        debug!(
+            "Trying to reconnect to {}. Reopen connection, 0rtt is not implemented yet.",
+            self.peer
+        );
         // We can reconnect using 0rtt, but not a priority for now. Check if we
         // need to call config.enable_0rtt() on the client side and where
         // session tickets are stored.
