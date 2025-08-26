@@ -30,8 +30,9 @@ use {
             is_within_range,
         },
     },
-    solana_cli_output::{CliAccount, OutputFormat},
+    solana_cli_output::{display::build_balance_message, CliAccount, OutputFormat},
     solana_clock::{Epoch, Slot},
+    solana_cluster_type::ClusterType,
     solana_core::{
         banking_simulation::{BankingSimulator, BankingTraceEvents},
         system_monitor_service::{SystemMonitorService, SystemMonitorStatsReportConfig},
@@ -39,7 +40,6 @@ use {
     },
     solana_cost_model::{cost_model::CostModel, cost_tracker::CostTracker},
     solana_feature_gate_interface::{self as feature, Feature},
-    solana_genesis_config::ClusterType,
     solana_inflation::Inflation,
     solana_instruction::TRANSACTION_LEVEL_STACK_HEIGHT,
     solana_ledger::{
@@ -51,7 +51,7 @@ use {
     },
     solana_measure::{measure::Measure, measure_time},
     solana_message::SimpleAddressLoader,
-    solana_native_token::{lamports_to_sol, sol_to_lamports, Sol},
+    solana_native_token::{Sol, LAMPORTS_PER_SOL},
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_runtime::{
@@ -281,7 +281,7 @@ fn graph_forks(bank_forks: &BankForks, config: &GraphConfig) -> String {
                         format!(
                             "\nvotes: {}, stake: {:.1} SOL ({:.1}%)",
                             votes,
-                            lamports_to_sol(*stake),
+                            build_balance_message(*stake, false, false),
                             *stake as f64 / *total_stake as f64 * 100.,
                         )
                     } else {
@@ -377,7 +377,7 @@ fn graph_forks(bank_forks: &BankForks, config: &GraphConfig) -> String {
                 r#"  "last vote {}"[shape=box,label="Latest validator vote: {}\nstake: {} SOL\nroot slot: {}\n{}"];"#,
                 node_pubkey,
                 node_pubkey,
-                lamports_to_sol(*stake),
+                build_balance_message(*stake, false, false),
                 vote_state_view.root_slot().unwrap_or(0),
                 vote_history,
             ));
@@ -399,7 +399,7 @@ fn graph_forks(bank_forks: &BankForks, config: &GraphConfig) -> String {
         dot.push(format!(
             r#"    "..."[label="...\nvotes: {}, stake: {:.1} SOL {:.1}%"];"#,
             absent_votes,
-            lamports_to_sol(absent_stake),
+            build_balance_message(absent_stake, false, false),
             absent_stake as f64 / lowest_total_stake as f64 * 100.,
         ));
     }
@@ -512,6 +512,7 @@ fn minimize_bank_for_snapshot(
     bank: &Bank,
     snapshot_slot: Slot,
     ending_slot: Slot,
+    should_recalculate_accounts_lt_hash: bool,
 ) -> bool {
     let ((transaction_account_set, possibly_incomplete), transaction_accounts_measure) = measure_time!(
         blockstore.get_accounts_used_in_range(bank, snapshot_slot, ending_slot),
@@ -520,7 +521,12 @@ fn minimize_bank_for_snapshot(
     let total_accounts_len = transaction_account_set.len();
     info!("Added {total_accounts_len} accounts from transactions. {transaction_accounts_measure}");
 
-    SnapshotMinimizer::minimize(bank, snapshot_slot, transaction_account_set);
+    SnapshotMinimizer::minimize(
+        bank,
+        snapshot_slot,
+        transaction_account_set,
+        should_recalculate_accounts_lt_hash,
+    );
     possibly_incomplete
 }
 
@@ -610,7 +616,34 @@ fn setup_slot_recording(
     let record_slots = arg_matches.occurrences_of("record_slots") > 0;
     let verify_slots = arg_matches.occurrences_of("verify_slots") > 0;
     match (record_slots, verify_slots) {
-        (false, false) => (None, None),
+        (false, false) => {
+            // for regualr replay ledger, report cost-tracker-stats after each
+            // slot is confirmed.
+            let slot_callback = Arc::new(move |bank: &Bank| {
+                // Block must be frozen by this point
+                assert!(bank.is_frozen());
+
+                let (total_transaction_fee, total_priority_fee) = {
+                    let collector_fee_details = bank.get_collector_fee_details();
+                    (
+                        collector_fee_details.total_transaction_fee(),
+                        collector_fee_details.total_priority_fee(),
+                    )
+                };
+
+                let cost_tracker = bank.read_cost_tracker().unwrap();
+                let slot = bank.slot();
+                let is_leader_block = false;
+                cost_tracker.report_stats(
+                    slot,
+                    is_leader_block,
+                    total_transaction_fee,
+                    total_priority_fee,
+                );
+            });
+
+            (Some(slot_callback as ProcessSlotCallback), None)
+        }
         (true, true) => {
             // .default_value() does not work with .conflicts_with() in clap 2.33
             // .conflicts_with("verify_slots")
@@ -651,7 +684,10 @@ fn setup_slot_recording(
                 }));
 
                 (
-                    Some(TransactionStatusSender { sender }),
+                    Some(TransactionStatusSender {
+                        sender,
+                        dependency_tracker: None,
+                    }),
                     transaction_recorder,
                 )
             } else {
@@ -739,7 +775,7 @@ fn record_transactions(
     slots: Arc<Mutex<Vec<SlotDetails>>>,
 ) {
     for tsm in recv {
-        if let TransactionStatusMessage::Batch(batch) = tsm {
+        if let TransactionStatusMessage::Batch((batch, _work_sequence)) = tsm {
             assert_eq!(batch.transactions.len(), batch.commit_results.len());
 
             let transactions: Vec<_> = batch
@@ -905,10 +941,10 @@ fn main() {
         .help("Print account data in specified format when printing account contents.");
 
     let rent = Rent::default();
-    let default_bootstrap_validator_lamports = &sol_to_lamports(500.0)
+    let default_bootstrap_validator_lamports = &(500 * LAMPORTS_PER_SOL)
         .max(VoteStateV3::get_rent_exempt_reserve(&rent))
         .to_string();
-    let default_bootstrap_validator_stake_lamports = &sol_to_lamports(0.5)
+    let default_bootstrap_validator_stake_lamports = &(LAMPORTS_PER_SOL / 2)
         .max(rent.minimum_balance(StakeStateV2::size_of()))
         .to_string();
     let default_graph_vote_account_mode = GraphVoteAccountMode::default();
@@ -1280,8 +1316,8 @@ fn main() {
                         .value_name("DIR")
                         .takes_value(true)
                         .help(
-                            "Output directory for the snapshot \
-                             [default: --snapshot-archive-path if present else --ledger directory]",
+                            "Output directory for the snapshot [default: --snapshot-archive-path \
+                             if present else --ledger directory]",
                         ),
                 )
                 .arg(
@@ -1432,6 +1468,21 @@ fn main() {
                         .takes_value(true)
                         .value_name("ENDING_SLOT")
                         .help("Ending slot for minimized snapshot creation"),
+                )
+                .arg(
+                    Arg::with_name("recalculate_accounts_lt_hash")
+                        .long("recalculate-accounts-lt-hash")
+                        .takes_value(false)
+                        .help("Recalculate the accounts lt hash for minimized snapshots")
+                        .long_help(
+                            "Recalculate the accounts lt hash for minimized snapshots. Without \
+                             this flag, loading the minimized snapshot will fail startup accounts \
+                             verification because the accounts lt hash will not match due to the \
+                             pruned account state. If not recalculating the accounts lt hash, \
+                             pass `--accounts-db-skip-initial-hash-calculation` to `leder-tool \
+                             verify` in order to bypass this check.",
+                        )
+                        .requires("minimized"),
                 )
                 .arg(
                     Arg::with_name("snapshot_archive_format")
@@ -2380,6 +2431,7 @@ fn main() {
                             &bank,
                             snapshot_slot,
                             ending_slot.unwrap(),
+                            arg_matches.is_present("recalculate_accounts_lt_hash"),
                         )
                     } else {
                         false

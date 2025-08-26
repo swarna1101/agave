@@ -1,13 +1,16 @@
-//! File I/O buffered reader for AppendVec
-//! Specialized `BufRead`-like type for reading account data.
+//! File I/O buffered readers for AppendVec
+//! Specialized `BufRead`-like types for reading account data.
 //!
-//! Callers can use this type to iterate efficiently over append vecs. They can do so by repeatedly
-//! calling `fill_buf()`, `consume()` and `set_required_data_len(account_data_len)` once the next account
-//! data length is known.
+//! Callers can use these types to iterate efficiently over append vecs. They can do so by repeatedly
+//! calling:
+//! * `fill_buf_required(account_meta_len)` to scan the account metadata parts and determine the account
+//!   data size,
+//!  * optionally extend the obtained buffer to full account data using
+//!    `fill_buf_required(account_all_bytes_len)`
+//!  * `consume(account_all_bytes_len)` to move to the next account
 //!
-//! Unlike BufRead/BufReader, this type guarantees that on the next `fill_buf()` after calling
-//! `set_required_data_len(len)`, the whole account data is buffered _linearly_ in memory and available to
-//! be returned.
+//! When reading full accounts data whose sizes exceed the small stack buffer, the `BufReaderWithOverflow`
+//! should be used, which supports dynamically allocated buffer for preparing contiguous data slices.
 use {
     crate::file_io::{read_into_buffer, read_more_buffer},
     std::{
@@ -62,47 +65,48 @@ impl<const N: usize> Backing for Stack<N> {
     }
 }
 
-/// An extension of the `BufRead` trait for file readers that require stronger control
-/// over returned buffer size and tracking of the file offset.
-///
-/// Unlike the standard `fill_buf`, which only guarantees a non-empty buffer,
-/// this trait allows callers to:
-/// - Enforce a minimum number of contiguous bytes to be made available.
-/// - Fall back to an overflow buffer if the internal buffer cannot satisfy the request.
-/// - Retrieve the current file offset corresponding to the start of the next buffer.
-pub(crate) trait ContiguousBufFileRead<'a>: BufRead {
+/// An extension of the `BufRead` trait for file readers that allow tracking file
+/// read position offset.
+pub(crate) trait FileBufRead<'a>: BufRead {
+    /// Activate the given `file` as source of reads of this reader.
+    ///
+    /// Resets the internal buffer to an empty state and sets the file offset to 0.
+    ///
+    /// `read_limit` provides a pre-defined limit on the number of bytes that can be read
+    /// from the file (unless EOF is reached).
+    fn set_file(&mut self, file: &'a File, read_limit: usize) -> io::Result<()>;
+
     /// Returns the current file offset corresponding to the start of the buffer
-    /// that will be returned by the next call to `fill_buf_*`.
+    /// that will be returned by the next call to `fill_buf`.
     ///
     /// This offset represents the position within the underlying file where data
     /// will be consumed from.
     fn get_file_offset(&self) -> usize;
+}
 
+/// An extension of the `BufRead` trait for readers that require stronger control
+/// over returned buffer size.
+///
+/// Unlike the standard `BufRead`, which only guarantees a non-empty buffer,
+/// this trait allows callers to enforce a minimum number of contiguous bytes
+/// to be made available.
+pub(crate) trait RequiredLenBufRead: BufRead {
     /// Ensures the internal buffer contains at least `required_len` contiguous bytes,
-    /// and returns a slice to that buffer.
+    /// and returns a slice of that buffer.
+    ///
+    /// Note: subsequent calls with the same or larger `required_len` are allowed, but
+    /// before requesting smaller length all already provided bytes should be consumed
+    /// using a single `consume` call.
     ///
     /// Returns `Err(io::ErrorKind::UnexpectedEof)` if the end of file is reached
     /// before the required number of bytes is available.
+    ///
+    /// Returns `Err(io::ErrorKind::QuotaExceeded)` if `required_len` exceeds supported limit.
     fn fill_buf_required(&mut self, required_len: usize) -> io::Result<&[u8]>;
-
-    /// Attempts to provide at least `required_len` contiguous bytes by using
-    /// the internal buffer or the provided `overflow_buffer` if needed.
-    ///
-    /// If the internal buffer alone does not satisfy the requirement, additional
-    /// bytes are read and appended to `overflow_buffer`, which is resized to fit the data.
-    ///
-    /// Returns a slice containing all the required data (may point to either buffer).
-    ///
-    /// Returns `Err(io::ErrorKind::UnexpectedEof)` if the end of file is reached
-    /// before the required number of bytes can be read.
-    fn fill_buf_required_or_overflow<'b>(
-        &'b mut self,
-        required_len: usize,
-        overflow_buffer: &'b mut Vec<u8>,
-    ) -> io::Result<&'b [u8]>
-    where
-        'a: 'b;
 }
+
+pub(crate) trait RequiredLenBufFileRead<'a>: RequiredLenBufRead + FileBufRead<'a> {}
+impl<'a, T: RequiredLenBufRead + FileBufRead<'a>> RequiredLenBufFileRead<'a> for T {}
 
 /// read a file a large buffer at a time and provide access to a slice in that buffer
 pub struct BufferedReader<'a, T> {
@@ -117,26 +121,41 @@ pub struct BufferedReader<'a, T> {
     /// how many bytes are valid in the file. The file's len may be longer.
     file_len_valid: usize,
     /// reference to file handle
-    file: &'a File,
+    file: Option<&'a File>,
 }
 
-impl<'a, T> BufferedReader<'a, T> {
-    /// `buffer_size`: how much to try to read at a time
-    /// `file_len_valid`: # bytes that are valid in the file, may be less than overall file len
-    /// `default_min_read_requirement`: make sure we always have this much data available if we're asked to read
-    pub fn new(backing: T, file_len_valid: usize, file: &'a File) -> Self {
+impl<'a, T: Backing> BufferedReader<'a, T> {
+    pub fn new(backing: T) -> Self {
         Self {
             file_offset_of_next_read: 0,
             buf: backing,
             buf_valid_bytes: 0..0,
             file_last_offset: 0,
-            file_len_valid,
-            file,
+            file_len_valid: 0,
+            file: None,
         }
+    }
+
+    pub fn with_file(mut self, file: &'a File, read_limit: usize) -> Self {
+        self.do_set_file(file, read_limit);
+        self
+    }
+
+    fn do_set_file(&mut self, file: &'a File, read_limit: usize) {
+        self.file = Some(file);
+        self.file_len_valid = read_limit;
+        self.file_last_offset = 0;
+        self.file_offset_of_next_read = 0;
+        self.buf_valid_bytes = 0..0;
     }
 }
 
-impl<'a, T: Backing> ContiguousBufFileRead<'a> for BufferedReader<'a, T> {
+impl<'a, T: Backing> FileBufRead<'a> for BufferedReader<'a, T> {
+    fn set_file(&mut self, file: &'a File, read_limit: usize) -> io::Result<()> {
+        self.do_set_file(file, read_limit);
+        Ok(())
+    }
+
     #[inline(always)]
     fn get_file_offset(&self) -> usize {
         if self.buf_valid_bytes.is_empty() {
@@ -144,62 +163,6 @@ impl<'a, T: Backing> ContiguousBufFileRead<'a> for BufferedReader<'a, T> {
         } else {
             self.file_last_offset + self.buf_valid_bytes.start
         }
-    }
-
-    fn fill_buf_required(&mut self, required_len: usize) -> io::Result<&[u8]> {
-        if self.buf_valid_bytes.len() < required_len {
-            self.read_more_bytes()?;
-            if self.buf_valid_bytes.len() < required_len {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "unable to read enough data",
-                ));
-            }
-        }
-        Ok(self.valid_slice())
-    }
-
-    fn fill_buf_required_or_overflow<'b>(
-        &'b mut self,
-        required_len: usize,
-        overflow_buffer: &'b mut Vec<u8>,
-    ) -> io::Result<&'b [u8]>
-    where
-        'a: 'b,
-    {
-        if required_len <= self.buf.capacity() {
-            return self.fill_buf_required(required_len);
-        }
-
-        if required_len > overflow_buffer.capacity() {
-            overflow_buffer.reserve_exact(required_len - overflow_buffer.len());
-        }
-        // SAFETY: We only write to the uninitialized portion of the buffer via `copy_from_slice` and `read_into_buffer`.
-        // Later, we ensure we only read from the initialized portion of the buffer.
-        unsafe {
-            overflow_buffer.set_len(required_len);
-        }
-
-        // Copy already read data to overflow buffer.
-        let available_valid_data = self.valid_slice();
-        let leftover = available_valid_data.len();
-        overflow_buffer[..leftover].copy_from_slice(available_valid_data);
-
-        // Read remaining data into overflow buffer.
-        let read_dst = &mut overflow_buffer[leftover..];
-        let bytes_read = read_into_buffer(
-            self.file,
-            self.file_len_valid,
-            self.file_offset_of_next_read,
-            read_dst,
-        )?;
-        if bytes_read < read_dst.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "unable to read required amount of data",
-            ));
-        }
-        Ok(overflow_buffer.as_slice())
     }
 }
 
@@ -213,8 +176,11 @@ where
         // we haven't used all the bytes we read last time, so adjust the effective offset
         debug_assert!(self.buf_valid_bytes.len() <= self.file_offset_of_next_read);
         self.file_last_offset = self.file_offset_of_next_read - self.buf_valid_bytes.len();
+        let Some(file) = &self.file else {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "no open file"));
+        };
         read_more_buffer(
-            self.file,
+            file,
             self.file_len_valid,
             &mut self.file_offset_of_next_read,
             // SAFETY: `read_more_buffer` will only _write_ to uninitialized memory and lifetime is tied to self.
@@ -230,23 +196,43 @@ where
     }
 }
 
-impl<'a, const N: usize> BufferedReader<'a, Stack<N>> {
+impl<const N: usize> BufferedReader<'_, Stack<N>> {
     /// create a new buffered reader with a stack-allocated buffer
-    pub fn new_stack(file_len_valid: usize, file: &'a File) -> Self {
-        BufferedReader::new(Stack::new(), file_len_valid, file)
+    pub fn new_stack() -> Self {
+        BufferedReader::new(Stack::new())
     }
 }
 
 impl<T: Backing> io::Read for BufferedReader<'_, T> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let available = self.fill_buf()?;
-        if available.is_empty() {
-            return Ok(0);
+    fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
+        let available_len = self.buf_valid_bytes.len();
+        if available_len > 0 {
+            // Copy already read data to buf.
+            let available_valid_data = self.valid_slice();
+            if available_len >= buf.len() {
+                buf.copy_from_slice(&available_valid_data[..buf.len()]);
+                self.consume(buf.len());
+                return Ok(buf.len());
+            }
+            // Only part of the buffer can be filled.
+            buf[..available_len].copy_from_slice(available_valid_data);
+            buf = &mut buf[available_len..];
         }
-        let bytes_to_read = available.len().min(buf.len());
-        buf[..bytes_to_read].copy_from_slice(&available[..bytes_to_read]);
-        self.consume(bytes_to_read);
-        Ok(bytes_to_read)
+
+        // Read directly from file into space still left in the buf.
+        let Some(file) = &self.file else {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "no open file"));
+        };
+        let bytes_read = read_into_buffer(
+            file,
+            self.file_len_valid,
+            self.file_offset_of_next_read,
+            buf,
+        )?;
+        let filled_len = bytes_read + available_len;
+        // Buffer was successfully filled, drop buffered data and move offset.
+        self.consume(filled_len);
+        Ok(filled_len)
     }
 }
 
@@ -276,6 +262,146 @@ impl<T: Backing> BufRead for BufferedReader<'_, T> {
     }
 }
 
+/// Supported `required_len` is limited by backing buffer size without ability to grow.
+impl<T: Backing> RequiredLenBufRead for BufferedReader<'_, T> {
+    fn fill_buf_required(&mut self, required_len: usize) -> io::Result<&[u8]> {
+        if self.buf_valid_bytes.len() < required_len {
+            self.read_more_bytes()?;
+            if self.buf_valid_bytes.len() < required_len {
+                if required_len > self.buf.capacity() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::QuotaExceeded,
+                        "requested more bytes than supported by buffer",
+                    ));
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unable to read enough data",
+                ));
+            }
+        }
+        Ok(self.valid_slice())
+    }
+}
+
+/// A buffered reader that wraps `BufRead` instance and implements `RequiredLenBufRead`.
+///
+/// It uses auxiliary overflow buffer when `fill_buf` returns slice that doesn't satisfy
+/// the length requirement.
+pub struct BufReaderWithOverflow<R> {
+    reader: R,
+    overflow_buf: Vec<u8>,
+    overflow_min_capacity: usize,
+    overflow_max_capacity: usize,
+}
+
+impl<R: BufRead> BufReaderWithOverflow<R> {
+    pub fn new(reader: R, overflow_min_capacity: usize, overflow_max_capacity: usize) -> Self {
+        Self {
+            reader,
+            overflow_buf: Vec::new(),
+            overflow_min_capacity,
+            overflow_max_capacity,
+        }
+    }
+}
+
+impl<R: BufRead> io::Read for BufReaderWithOverflow<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let available_len = self.overflow_buf.len();
+        if available_len == 0 {
+            self.reader.read(buf)
+        } else {
+            assert!(
+                buf.len() >= available_len,
+                "should read all previously required bytes"
+            );
+            buf[..available_len].copy_from_slice(&self.overflow_buf);
+            self.overflow_buf.clear();
+            if buf.len() > available_len {
+                let bytes_read = self.reader.read(&mut buf[available_len..])?;
+                Ok(available_len + bytes_read)
+            } else {
+                Ok(available_len)
+            }
+        }
+    }
+}
+
+impl<R: BufRead> BufRead for BufReaderWithOverflow<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.overflow_buf.is_empty() {
+            self.reader.fill_buf()
+        } else {
+            Ok(self.overflow_buf.as_slice())
+        }
+    }
+
+    fn consume(&mut self, mut amt: usize) {
+        let overflow_len = self.overflow_buf.len();
+        if overflow_len > 0 {
+            amt = amt
+                .checked_sub(overflow_len)
+                .expect("should consume all previously required bytes");
+            self.overflow_buf.clear();
+        }
+        self.reader.consume(amt);
+    }
+}
+
+impl<'a, R: FileBufRead<'a>> FileBufRead<'a> for BufReaderWithOverflow<R> {
+    fn set_file(&mut self, file: &'a File, read_limit: usize) -> io::Result<()> {
+        self.overflow_buf.clear();
+        self.reader.set_file(file, read_limit)
+    }
+
+    fn get_file_offset(&self) -> usize {
+        self.reader.get_file_offset() - self.overflow_buf.len()
+    }
+}
+
+/// Support large `required_len` (within configured limits) by using overflow buffer
+/// retained during lifetime of the reader.
+impl<R: BufRead> RequiredLenBufRead for BufReaderWithOverflow<R> {
+    fn fill_buf_required(&mut self, required_len: usize) -> io::Result<&[u8]> {
+        let available_len = self.overflow_buf.len();
+        if available_len == 0 {
+            let buf = self.reader.fill_buf()?;
+            if buf.len() >= required_len {
+                // Separate fill_buf call is needed due to borrow checker's limitation
+                // https://rust-lang.github.io/rfcs/2094-nll.html#problem-case-3-conditional-control-flow-across-functions
+                return self.reader.fill_buf();
+            }
+        }
+        assert!(
+            available_len <= required_len,
+            "fill_buf_required should keep or grow required_len until consume"
+        );
+        if required_len > self.overflow_buf.capacity() {
+            let target_capacity = required_len
+                .next_power_of_two()
+                .clamp(self.overflow_min_capacity, self.overflow_max_capacity);
+            if required_len > target_capacity {
+                return Err(io::Error::new(
+                    io::ErrorKind::QuotaExceeded,
+                    "requested more bytes than allowed capacity range",
+                ));
+            }
+            self.overflow_buf
+                .reserve_exact(target_capacity - available_len);
+        }
+        // Safety: we have reserved capacity and all of it will be filled by read
+        unsafe { self.overflow_buf.set_len(required_len) };
+
+        // On error overflow buffer is completely cleared to avoid access to
+        // uninitialized memory.
+        self.reader
+            .read_exact(&mut self.overflow_buf[available_len..])
+            .inspect_err(|_| self.overflow_buf.clear())?;
+        Ok(self.overflow_buf.as_slice())
+    }
+}
+
 /// Open file at `path` with buffering reader using `buf_size` memory and doing
 /// read-ahead IO reads (if `io_uring` is supported by the host)
 pub fn large_file_buf_reader(
@@ -284,15 +410,12 @@ pub fn large_file_buf_reader(
 ) -> io::Result<Box<dyn BufRead>> {
     #[cfg(target_os = "linux")]
     if agave_io_uring::io_uring_supported() {
-        use crate::io_uring::sequential_file_reader::SequentialFileReader;
+        use crate::io_uring::sequential_file_reader::{SequentialFileReader, DEFAULT_READ_SIZE};
 
-        let io_uring_reader = SequentialFileReader::with_capacity(buf_size, &path);
-        match io_uring_reader {
-            Ok(reader) => return Ok(Box::new(reader)),
-            Err(error) => {
-                log::warn!("unable to create io_uring reader: {error}");
-            }
-        }
+        let buf_size = buf_size.max(DEFAULT_READ_SIZE);
+        return Ok(Box::new(SequentialFileReader::with_capacity(
+            buf_size, path,
+        )?));
     }
     let file = File::open(path)?;
     Ok(Box::new(BufReader::with_capacity(buf_size, file)))
@@ -301,7 +424,10 @@ pub fn large_file_buf_reader(
 #[cfg(test)]
 mod tests {
     use {
-        super::*, crate::append_vec::ValidSlice, std::io::Write, tempfile::tempfile,
+        super::*,
+        crate::append_vec::ValidSlice,
+        std::io::{Read as _, Write},
+        tempfile::tempfile,
         test_case::test_case,
     };
 
@@ -323,7 +449,7 @@ mod tests {
         // First read 16 bytes to fill buffer
         let file_len_valid = 32;
         let default_min_read = 8;
-        let mut reader = BufferedReader::new(backing, file_len_valid, &sample_file);
+        let mut reader = BufferedReader::new(backing).with_file(&sample_file, file_len_valid);
         let offset = reader.get_file_offset();
         let slice = ValidSlice::new(reader.fill_buf_required(default_min_read).unwrap());
         let mut expected_offset = 0;
@@ -331,7 +457,8 @@ mod tests {
         assert_eq!(slice.len(), buffer_size);
         assert_eq!(slice.slice(), &bytes[0..buffer_size]);
 
-        // Consume the data and attempt to read next 32 bytes, expect to hit EOF
+        // Consume the data and attempt to read next 32 bytes, which is above supported buffer size,
+        // so file offset is moved, but call returns quota error.
         let advance = 16;
         let mut required_len = 32;
         reader.consume(advance);
@@ -341,9 +468,9 @@ mod tests {
         assert_eq!(
             reader
                 .fill_buf_required(required_len)
-                .expect_err("should hit EOF")
+                .expect_err("should fail due to required length above buffer size")
                 .kind(),
-            io::ErrorKind::UnexpectedEof
+            io::ErrorKind::QuotaExceeded
         );
 
         // Continue reading should yield EOF.
@@ -351,6 +478,7 @@ mod tests {
         let offset = reader.get_file_offset();
         expected_offset += advance;
         assert_eq!(offset, expected_offset);
+        required_len = 16;
         assert_eq!(
             reader
                 .fill_buf_required(required_len)
@@ -382,7 +510,7 @@ mod tests {
 
         // First read 16 bytes to fill buffer
         let default_min_read_size = 8;
-        let mut reader = BufferedReader::new(backing, valid_len, &sample_file);
+        let mut reader = BufferedReader::new(backing).with_file(&sample_file, valid_len);
         let offset = reader.get_file_offset();
         let slice = ValidSlice::new(reader.fill_buf_required(default_min_read_size).unwrap());
         let mut expected_offset = 0;
@@ -390,9 +518,9 @@ mod tests {
         assert_eq!(slice.len(), buffer_size);
         assert_eq!(slice.slice(), &bytes[0..buffer_size]);
 
-        // Consume the data and attempt read next 32 bytes, expect to hit `valid_len`, and only read 14 bytes
+        // Consume the data and attempt read next 16 bytes, expect to hit `valid_len`, and only read 14 bytes
         let mut advance = 16;
-        let mut required_data_len = 32;
+        let mut required_data_len = 16;
         reader.consume(advance);
         let offset = reader.get_file_offset();
         expected_offset += advance;
@@ -407,7 +535,7 @@ mod tests {
 
         // Continue reading should yield EOF.
         advance = 14;
-        required_data_len = 32;
+        required_data_len = 16;
         reader.consume(advance);
         let offset = reader.get_file_offset();
         expected_offset += advance;
@@ -462,7 +590,7 @@ mod tests {
         // First read 16 bytes to fill buffer
         let file_len_valid = 32;
         let default_min_read_size = 8;
-        let mut reader = BufferedReader::new(backing, file_len_valid, &sample_file);
+        let mut reader = BufferedReader::new(backing).with_file(&sample_file, file_len_valid);
         let offset = reader.get_file_offset();
         let slice = ValidSlice::new(reader.fill_buf_required(default_min_read_size).unwrap());
         let mut expected_offset = 0;
@@ -500,7 +628,7 @@ mod tests {
 
         // Continue reading should yield EOF and empty slice.
         advance = 16;
-        required_len = 32;
+        required_len = 16;
         reader.consume(advance);
         let offset = reader.get_file_offset();
         expected_offset += advance;
@@ -511,6 +639,16 @@ mod tests {
                 .expect_err("should hit EOF")
                 .kind(),
             io::ErrorKind::UnexpectedEof
+        );
+
+        // Attempt to read more than the buffer size
+        required_len = 32;
+        assert_eq!(
+            reader
+                .fill_buf_required(required_len)
+                .expect_err("should fail due to too large required length")
+                .kind(),
+            io::ErrorKind::QuotaExceeded
         );
     }
 
@@ -525,7 +663,7 @@ mod tests {
         // First read 16 bytes to fill buffer
         let valid_len = 32;
         let default_min_read = 8;
-        let mut reader = BufferedReader::new(backing, valid_len, &sample_file);
+        let mut reader = BufferedReader::new(backing).with_file(&sample_file, valid_len);
         let offset = reader.get_file_offset();
         let slice = ValidSlice::new(reader.fill_buf_required(default_min_read).unwrap());
         let mut expected_offset = 0;
@@ -571,51 +709,92 @@ mod tests {
         let bytes = rand_bytes::<FILE_SIZE>();
         sample_file.write_all(&bytes).unwrap();
 
-        let file_len_valid = 32;
-        let mut reader = BufferedReader::new(backing, file_len_valid, &sample_file);
+        let mut reader = BufReaderWithOverflow::new(
+            BufferedReader::new(backing).with_file(&sample_file, FILE_SIZE),
+            0,
+            usize::MAX,
+        );
 
         // Case 1: required_len <= buffer_size (no overflow needed)
-        let mut overflow = Vec::new();
         let required_len = 8;
-        let slice = reader
-            .fill_buf_required_or_overflow(required_len, &mut overflow)
-            .unwrap();
+        let slice = reader.fill_buf_required(required_len).unwrap();
         assert_eq!(&slice[..required_len], &bytes[..required_len]);
-        assert!(overflow.is_empty());
 
         // Consume part of the buffer to simulate partial reading
         reader.consume(required_len);
 
         // Case 2: required_len > buffer_size (overflow required)
-        let mut overflow = Vec::new();
         let required_len = buffer_size + 8;
-        let slice = reader
-            .fill_buf_required_or_overflow(required_len, &mut overflow)
-            .unwrap();
+        let slice = reader.fill_buf_required(required_len).unwrap();
 
         // Internal buffer is size `buffer_size`, overflow should extend with the remaining `8` bytes
         assert_eq!(slice.len(), required_len);
         assert_eq!(slice, &bytes[8..8 + required_len]);
-        assert_eq!(overflow.len(), required_len);
 
         // Consume everything to reach EOF
         reader.consume(required_len);
 
         // Case 3: required_len larger than remaining data (expect UnexpectedEof)
-        let mut overflow = Vec::new();
         let required_len = 64;
-        let result = reader.fill_buf_required_or_overflow(required_len, &mut overflow);
+        let result = reader.fill_buf_required(required_len);
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
 
         // Case 4: required_len = 0 (should return empty slice)
-        let mut overflow = Vec::new();
         let required_len = 0;
         let offset_before = reader.get_file_offset();
-        let slice = reader
-            .fill_buf_required_or_overflow(required_len, &mut overflow)
-            .unwrap();
+        let slice = reader.fill_buf_required(required_len).unwrap();
         assert_eq!(slice.len(), 0);
         let offset_after = reader.get_file_offset();
         assert_eq!(offset_before, offset_after);
+    }
+
+    #[test_case(Stack::<16>::new(), 16)]
+    fn test_overflow_reader_read_and_fill_buf(backing: impl Backing, buffer_size: usize) {
+        const FILE_SIZE: usize = 64;
+        let mut sample_file = tempfile().unwrap();
+        let bytes = rand_bytes::<FILE_SIZE>();
+        sample_file.write_all(&bytes).unwrap();
+
+        let mut reader = BufReaderWithOverflow::new(
+            BufferedReader::new(backing).with_file(&sample_file, FILE_SIZE),
+            0,
+            32,
+        );
+        let buf = reader.fill_buf().unwrap();
+        assert_eq!(buf, &bytes[0..buffer_size]);
+
+        reader.consume(8);
+        let mut buf = [0; 8];
+        assert_eq!(reader.read(&mut buf).unwrap(), 8);
+        assert_eq!(buf, &bytes[8..16]);
+
+        assert_eq!(
+            reader
+                .fill_buf_required(40)
+                .expect_err("should exceed len limit")
+                .kind(),
+            io::ErrorKind::QuotaExceeded
+        );
+
+        // Required buffer is at maximum configured limit.
+        let buf = reader.fill_buf_required(32).unwrap();
+        assert_eq!(buf, &bytes[16..48]);
+        // Same buffer should be returned.
+        let buf = reader.fill_buf().unwrap();
+        assert_eq!(buf, &bytes[16..48]);
+
+        let mut buf = [0; 48];
+        assert_eq!(reader.read(&mut buf).unwrap(), 48);
+        assert_eq!(buf, &bytes[16..64]);
+
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+
+        assert_eq!(
+            reader
+                .fill_buf_required(1)
+                .expect_err("should reach EOF")
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 }

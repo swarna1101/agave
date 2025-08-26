@@ -3,9 +3,17 @@
 use {
     crate::accounts_db::{AccountStorageEntry, AccountsFileId},
     dashmap::DashMap,
+    rand::seq::SliceRandom,
+    rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
     solana_clock::Slot,
     solana_nohash_hasher::{BuildNoHashHasher, IntMap},
-    std::sync::{Arc, RwLock},
+    std::{
+        ops::{Index, Range},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, RwLock,
+        },
+    },
 };
 
 pub mod stored_account_info;
@@ -76,6 +84,14 @@ impl AccountStorage {
             "self.no_shrink_in_progress(): {slot}"
         );
         self.get_slot_storage_entry_shrinking_in_progress_ok(slot)
+    }
+
+    pub(super) fn all_storages(&self) -> Vec<Arc<AccountStorageEntry>> {
+        assert!(self.no_shrink_in_progress());
+        self.map
+            .iter()
+            .map(|item| Arc::clone(item.value()))
+            .collect()
     }
 
     pub(crate) fn replace_storage_with_equivalent(
@@ -291,6 +307,129 @@ impl Default for AccountStorageStatus {
     fn default() -> Self {
         Self::Available
     }
+}
+
+/// Wrapper over slice of `Arc<AccountStorageEntry>` that provides an ordered access to storages.
+///
+/// A few strategies are available for ordering storages:
+/// - `with_small_to_large_ratio`: interleaving small and large storage file sizes
+/// - `with_random_order`: orders storages randomly
+pub struct AccountStoragesOrderer<'a> {
+    storages: &'a [Arc<AccountStorageEntry>],
+    indices: Box<[usize]>,
+}
+
+impl<'a> AccountStoragesOrderer<'a> {
+    /// Create balancing orderer that interleaves storages with small and large file sizes.
+    ///
+    /// Storages are returned in cycles based on `small_to_large_ratio` - `ratio.0` small storages
+    /// preceding `ratio.1` large storages.
+    pub fn with_small_to_large_ratio(
+        storages: &'a [Arc<AccountStorageEntry>],
+        small_to_large_ratio: (usize, usize),
+    ) -> Self {
+        let len_range = 0..storages.len();
+        let mut indices: Vec<_> = len_range.clone().collect();
+        indices.sort_unstable_by_key(|i| storages[*i].capacity());
+        indices.iter_mut().for_each(|i| {
+            *i = select_from_range_with_start_end_rates(len_range.clone(), *i, small_to_large_ratio)
+        });
+        Self {
+            storages,
+            indices: indices.into_boxed_slice(),
+        }
+    }
+
+    /// Create randomizing orderer.
+    pub fn with_random_order(storages: &'a [Arc<AccountStorageEntry>]) -> Self {
+        let mut indices: Vec<usize> = (0..storages.len()).collect();
+        indices.shuffle(&mut rand::thread_rng());
+        Self {
+            storages,
+            indices: indices.into_boxed_slice(),
+        }
+    }
+
+    pub fn entries_len(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn iter(&'a self) -> impl ExactSizeIterator<Item = &'a AccountStorageEntry> + 'a {
+        self.indices.iter().map(|i| self.storages[*i].as_ref())
+    }
+
+    pub fn par_iter(&'a self) -> impl IndexedParallelIterator<Item = &'a AccountStorageEntry> + 'a {
+        self.indices.par_iter().map(|i| self.storages[*i].as_ref())
+    }
+
+    pub fn into_concurrent_consumer(self) -> AccountStoragesConcurrentConsumer<'a> {
+        AccountStoragesConcurrentConsumer::new(self)
+    }
+}
+
+impl Index<usize> for AccountStoragesOrderer<'_> {
+    type Output = AccountStorageEntry;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.storages[self.indices[index]].as_ref()
+    }
+}
+
+/// A thread-safe, lock-free iterator for consuming `AccountStorageEntry` values
+/// from an `AccountStoragesOrderer` across multiple threads.
+///
+/// Unlike standard iterators, `AccountStoragesConcurrentConsumer`:
+/// - Is **shared** between threads via references (`&self`), not moved.
+/// - Allows safe, parallel consumption where each item is yielded at most once.
+/// - Does **not** implement `Iterator` because it must take `&self` instead of `&mut self`.
+pub struct AccountStoragesConcurrentConsumer<'a> {
+    orderer: AccountStoragesOrderer<'a>,
+    current_index: AtomicUsize,
+}
+
+impl<'a> AccountStoragesConcurrentConsumer<'a> {
+    pub fn new(orderer: AccountStoragesOrderer<'a>) -> Self {
+        Self {
+            orderer,
+            current_index: AtomicUsize::new(0),
+        }
+    }
+
+    /// Takes the next `AccountStorageEntry` moving shared consume position
+    /// until the end of the entries source is reached.
+    pub fn next(&'a self) -> Option<&'a AccountStorageEntry> {
+        let index = self.current_index.fetch_add(1, Ordering::Relaxed);
+        if index < self.orderer.entries_len() {
+            Some(&self.orderer[index])
+        } else {
+            None
+        }
+    }
+}
+
+/// Select the `nth` (`0 <= nth < range.len()`) value from a `range`, choosing values alternately
+/// from its start or end according to a `start_rate : end_rate` ratio.
+///
+/// For every `start_rate` values selected from the start, `end_rate` values are selected from the end.
+/// The resulting sequence alternates in a balanced and interleaved fashion between the range's start and end.
+/// ```
+fn select_from_range_with_start_end_rates(
+    range: Range<usize>,
+    nth: usize,
+    (start_rate, end_rate): (usize, usize),
+) -> usize {
+    let range_len = range.len();
+    let cycle = start_rate + end_rate;
+    let cycle_index = nth % cycle;
+    let cycle_num = nth.checked_div(cycle).expect("rates sum must be positive");
+
+    let index = if cycle_index < start_rate {
+        cycle_num * start_rate + cycle_index
+    } else {
+        let end_index = cycle_num * end_rate + cycle_index - start_rate;
+        range_len - end_index - 1
+    };
+    range.start + index
 }
 
 #[cfg(test)]
@@ -621,5 +760,33 @@ pub(crate) mod tests {
             .unwrap()
             .insert(0, storage.get_test_storage());
         storage.get_if(|_, _| true);
+    }
+
+    #[test]
+    fn test_select_range_with_start_end_rates() {
+        let interleaved: Vec<_> = (0..10)
+            .map(|i| select_from_range_with_start_end_rates(1..11, i, (2, 1)))
+            .collect();
+        assert_eq!(interleaved, vec![1, 2, 10, 3, 4, 9, 5, 6, 8, 7]);
+
+        let interleaved: Vec<_> = (0..10)
+            .map(|i| select_from_range_with_start_end_rates(1..11, i, (1, 1)))
+            .collect();
+        assert_eq!(interleaved, vec![1, 10, 2, 9, 3, 8, 4, 7, 5, 6]);
+
+        let interleaved: Vec<_> = (0..9)
+            .map(|i| select_from_range_with_start_end_rates(1..10, i, (2, 1)))
+            .collect();
+        assert_eq!(interleaved, vec![1, 2, 9, 3, 4, 8, 5, 6, 7]);
+
+        let interleaved: Vec<_> = (0..9)
+            .map(|i| select_from_range_with_start_end_rates(1..10, i, (1, 2)))
+            .collect();
+        assert_eq!(interleaved, vec![1, 9, 8, 2, 7, 6, 3, 5, 4]);
+
+        let interleaved: Vec<_> = (0..13)
+            .map(|i| select_from_range_with_start_end_rates(1..14, i, (2, 3)))
+            .collect();
+        assert_eq!(interleaved, vec![1, 2, 13, 12, 11, 3, 4, 10, 9, 8, 5, 6, 7]);
     }
 }

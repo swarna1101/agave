@@ -97,7 +97,7 @@ use {
         token::{SPL_TOKEN_ACCOUNT_MINT_OFFSET, SPL_TOKEN_ACCOUNT_OWNER_OFFSET},
         token_2022::{self, ACCOUNTTYPE_ACCOUNT},
     },
-    spl_token_2022::{
+    spl_token_2022_interface::{
         extension::{
             interest_bearing_mint::InterestBearingConfig, scaled_ui_amount::ScaledUiAmountConfig,
             BaseStateWithExtensions, StateWithExtensions,
@@ -159,7 +159,7 @@ fn is_finalized(
         && (blockstore.is_root(slot) || bank.status_cache_ancestors().contains(&slot))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JsonRpcConfig {
     pub enable_rpc_transaction_history: bool,
     pub enable_extended_tx_metadata_storage: bool,
@@ -211,7 +211,7 @@ impl JsonRpcConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RpcBigtableConfig {
     pub enable_bigtable_ledger_upload: bool,
     pub bigtable_instance_name: String,
@@ -3454,7 +3454,7 @@ pub mod rpc_full {
     use {
         super::*,
         solana_message::{SanitizedVersionedMessage, VersionedMessage},
-        solana_transaction_status::parse_ui_inner_instructions,
+        solana_transaction_status::{parse_ui_inner_instructions, UiLoadedAddresses},
     };
     #[rpc]
     pub trait Full {
@@ -3891,6 +3891,11 @@ pub mod rpc_full {
                     loaded_accounts_data_size,
                     return_data,
                     inner_instructions: _, // Always `None` due to `enable_cpi_recording = false`
+                    fee,
+                    pre_balances: _,
+                    post_balances: _,
+                    pre_token_balances: _,
+                    post_token_balances: _,
                 } = preflight_bank.simulate_transaction(&transaction, false)
                 {
                     match err {
@@ -3912,6 +3917,12 @@ pub mod rpc_full {
                             return_data: return_data.map(|return_data| return_data.into()),
                             inner_instructions: None,
                             replacement_blockhash: None,
+                            fee,
+                            pre_balances: None,
+                            post_balances: None,
+                            pre_token_balances: None,
+                            post_token_balances: None,
+                            loaded_addresses: None,
                         },
                     }
                     .into());
@@ -3993,6 +4004,11 @@ pub mod rpc_full {
                 loaded_accounts_data_size,
                 return_data,
                 inner_instructions,
+                fee,
+                pre_balances,
+                post_balances,
+                pre_token_balances,
+                post_token_balances,
             } = bank.simulate_transaction(&transaction, enable_cpi_recording);
 
             let account_keys = transaction.message().account_keys();
@@ -4061,6 +4077,16 @@ pub mod rpc_full {
                     return_data: return_data.map(|return_data| return_data.into()),
                     inner_instructions,
                     replacement_blockhash: blockhash,
+                    fee,
+                    pre_balances,
+                    post_balances,
+                    pre_token_balances: pre_token_balances.map(|balances| {
+                        balances.into_iter().map(|balance| solana_ledger::transaction_balances::svm_token_info_to_token_balance(balance).into()).collect()
+                    }),
+                    post_token_balances: post_token_balances.map(|balances| {
+                        balances.into_iter().map(|balance| solana_ledger::transaction_balances::svm_token_info_to_token_balance(balance).into()).collect()
+                    }),
+                    loaded_addresses: Some(UiLoadedAddresses::from(&transaction.get_loaded_addresses())),
                 },
             ))
         }
@@ -4427,14 +4453,8 @@ pub fn populate_blockstore_for_tests(
 ) {
     let slot = bank.slot();
     let parent_slot = bank.parent_slot();
-    let shreds = solana_ledger::blockstore::entries_to_test_shreds(
-        &entries,
-        slot,
-        parent_slot,
-        true,
-        0,
-        true, // merkle_variant
-    );
+    let shreds =
+        solana_ledger::blockstore::entries_to_test_shreds(&entries, slot, parent_slot, true, 0);
     blockstore.insert_shreds(shreds, None, false).unwrap();
     blockstore.set_roots(std::iter::once(&slot)).unwrap();
 
@@ -4449,6 +4469,7 @@ pub fn populate_blockstore_for_tests(
             None,
             blockstore,
             false,
+            None,
             tss_exit.clone(),
         );
 
@@ -4461,6 +4482,7 @@ pub fn populate_blockstore_for_tests(
             Some(
                 &solana_ledger::blockstore_processor::TransactionStatusSender {
                     sender: transaction_status_sender,
+                    dependency_tracker: None,
                 },
             ),
             Some(&replay_vote_sender),
@@ -4507,7 +4529,6 @@ pub mod tests {
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
             get_tmp_ledger_path,
         },
-        solana_log_collector::ic_logger_msg,
         solana_message::{
             v0::{self, MessageAddressTableLookup},
             Message, MessageHeader, SimpleAddressLoader, VersionedMessage,
@@ -4540,6 +4561,7 @@ pub mod tests {
         solana_sha256_hasher::hash,
         solana_signer::Signer,
         solana_svm::account_loader::TRANSACTION_ACCOUNT_BASE_SIZE,
+        solana_svm_log_collector::ic_logger_msg,
         solana_system_interface::{instruction as system_instruction, program as system_program},
         solana_system_transaction as system_transaction,
         solana_sysvar::slot_hashes::SlotHashes,
@@ -4550,13 +4572,13 @@ pub mod tests {
             EncodedConfirmedBlock, EncodedTransaction, EncodedTransactionWithStatusMeta,
             TransactionDetails,
         },
-        solana_vote_interface::state::VoteState,
+        solana_vote_interface::state::VoteStateV3,
         solana_vote_program::{
             vote_instruction,
             vote_state::{self, TowerSync, VoteInit, VoteStateVersions, MAX_LOCKOUT_HISTORY},
         },
         spl_pod::optional_keys::OptionalNonZeroPubkey,
-        spl_token_2022::{
+        spl_token_2022_interface::{
             extension::{
                 immutable_owner::ImmutableOwner, memo_transfer::MemoTransfer,
                 mint_close_authority::MintCloseAuthority, BaseStateWithExtensionsMut,
@@ -4653,15 +4675,9 @@ pub mod tests {
         ic_logger_msg!(log_collector, "I am logging from a builtin program!");
         ic_logger_msg!(log_collector, "I am about to CPI to System!");
 
-        let from_pubkey = *transaction_context.get_key_of_account_at_index(
-            instruction_context.get_index_of_instruction_account_in_transaction(0)?,
-        )?;
-        let to_pubkey = *transaction_context.get_key_of_account_at_index(
-            instruction_context.get_index_of_instruction_account_in_transaction(1)?,
-        )?;
-        let owner_pubkey = *transaction_context.get_key_of_account_at_index(
-            instruction_context.get_index_of_instruction_account_in_transaction(2)?,
-        )?;
+        let from_pubkey = *instruction_context.get_key_of_instruction_account(0)?;
+        let to_pubkey = *instruction_context.get_key_of_instruction_account(1)?;
+        let owner_pubkey = *instruction_context.get_key_of_instruction_account(2)?;
 
         invoke_context.native_invoke(
             system_instruction::create_account(
@@ -5010,10 +5026,10 @@ pub mod tests {
             bank
         }
 
-        fn store_vote_account(&self, vote_pubkey: &Pubkey, vote_state: VoteState) {
+        fn store_vote_account(&self, vote_pubkey: &Pubkey, vote_state: VoteStateV3) {
             let bank = self.working_bank();
-            let versioned = VoteStateVersions::new_current(vote_state);
-            let space = VoteState::size_of();
+            let versioned = VoteStateVersions::new_v3(vote_state);
+            let space = VoteStateV3::size_of();
             let balance = bank.get_minimum_balance_for_rent_exemption(space);
             let mut vote_account =
                 AccountSharedData::new(balance, space, &solana_vote_program::id());
@@ -6020,6 +6036,12 @@ pub mod tests {
                     "err":null,
                     "innerInstructions": null,
                     "loadedAccountsDataSize": loaded_accounts_data_size,
+                    "fee": 5000,
+                    "loadedAddresses": {"readonly": [], "writable": []},
+                    "preBalances": [1000000000, 0, 1],
+                    "postBalances": [999982200, 12800, 1],
+                    "preTokenBalances": [],
+                    "postTokenBalances": [],
                     "logs":[
                         "Program 11111111111111111111111111111111 invoke [1]",
                         "Program 11111111111111111111111111111111 success"
@@ -6107,6 +6129,12 @@ pub mod tests {
                     "err":null,
                     "innerInstructions":null,
                     "loadedAccountsDataSize": loaded_accounts_data_size,
+                    "fee": 5000,
+                    "loadedAddresses": {"readonly": [], "writable": []},
+                    "preBalances": [1000000000, 0, 1],
+                    "postBalances": [999982200, 12800, 1],
+                    "preTokenBalances": [],
+                    "postTokenBalances": [],
                     "logs":[
                         "Program 11111111111111111111111111111111 invoke [1]",
                         "Program 11111111111111111111111111111111 success"
@@ -6138,6 +6166,12 @@ pub mod tests {
                     "err":null,
                     "innerInstructions":null,
                     "loadedAccountsDataSize": loaded_accounts_data_size,
+                    "fee": 5000,
+                    "loadedAddresses": {"readonly": [], "writable": []},
+                    "preBalances": [1000000000, 0, 1],
+                    "postBalances": [999982200, 12800, 1],
+                    "preTokenBalances": [],
+                    "postTokenBalances": [],
                     "logs":[
                         "Program 11111111111111111111111111111111 invoke [1]",
                         "Program 11111111111111111111111111111111 success"
@@ -6193,6 +6227,12 @@ pub mod tests {
                     "accounts":null,
                     "innerInstructions":null,
                     "loadedAccountsDataSize":0,
+                    "fee": null,
+                    "loadedAddresses": {"readonly": [], "writable": []},
+                    "preBalances": [1000000000, 0, 1],
+                    "postBalances": [1000000000, 0, 1],
+                    "preTokenBalances": [],
+                    "postTokenBalances": [],
                     "logs":[],
                     "replacementBlockhash": null,
                     "returnData": null,
@@ -6227,6 +6267,12 @@ pub mod tests {
                     "err":null,
                     "innerInstructions":null,
                     "loadedAccountsDataSize": loaded_accounts_data_size,
+                    "fee": 5000,
+                    "loadedAddresses": {"readonly": [], "writable": []},
+                    "preBalances": [1000000000, 0, 1],
+                    "postBalances": [999982200, 12800, 1],
+                    "preTokenBalances": [],
+                    "postTokenBalances": [],
                     "logs":[
                         "Program 11111111111111111111111111111111 invoke [1]",
                         "Program 11111111111111111111111111111111 success"
@@ -6259,11 +6305,11 @@ pub mod tests {
 
         // init mint
         let mint_rent_exempt_amount =
-            bank.get_minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN);
+            bank.get_minimum_balance_for_rent_exemption(spl_token_interface::state::Mint::LEN);
         let mint_pubkey = Pubkey::from_str("mint111111111111111111111111111111111111111").unwrap();
-        let mut mint_data = [0u8; spl_token::state::Mint::LEN];
+        let mut mint_data = [0u8; spl_token_interface::state::Mint::LEN];
         Pack::pack_into_slice(
-            &spl_token::state::Mint {
+            &spl_token_interface::state::Mint {
                 mint_authority: COption::None,
                 supply: 0,
                 decimals: 8,
@@ -6275,7 +6321,7 @@ pub mod tests {
         let account = AccountSharedData::create(
             mint_rent_exempt_amount,
             mint_data.into(),
-            spl_token::id(),
+            spl_token_interface::id(),
             false,
             0,
         );
@@ -6283,17 +6329,17 @@ pub mod tests {
 
         // init token account
         let token_account_rent_exempt_amount =
-            bank.get_minimum_balance_for_rent_exemption(spl_token::state::Account::LEN);
+            bank.get_minimum_balance_for_rent_exemption(spl_token_interface::state::Account::LEN);
         let token_account_pubkey = Pubkey::new_unique();
         let owner_pubkey = Pubkey::from_str("owner11111111111111111111111111111111111111").unwrap();
-        let mut token_account_data = [0u8; spl_token::state::Account::LEN];
+        let mut token_account_data = [0u8; spl_token_interface::state::Account::LEN];
         Pack::pack_into_slice(
-            &spl_token::state::Account {
+            &spl_token_interface::state::Account {
                 mint: mint_pubkey,
                 owner: owner_pubkey,
                 amount: 1,
                 delegate: COption::None,
-                state: spl_token::state::AccountState::Initialized,
+                state: spl_token_interface::state::AccountState::Initialized,
                 is_native: COption::None,
                 delegated_amount: 0,
                 close_authority: COption::None,
@@ -6303,7 +6349,7 @@ pub mod tests {
         let account = AccountSharedData::create(
             token_account_rent_exempt_amount,
             token_account_data.into(),
-            spl_token::id(),
+            spl_token_interface::id(),
             false,
             0,
         );
@@ -6370,14 +6416,20 @@ pub mod tests {
                               },
                               "executable": false,
                               "lamports": (token_account_rent_exempt_amount + 1),
-                              "owner": bs58::encode(spl_token::id()).into_string(),
+                              "owner": bs58::encode(spl_token_interface::id()).into_string(),
                               "rentEpoch": u64::MAX,
-                              "space": spl_token::state::Account::LEN
+                              "space": spl_token_interface::state::Account::LEN
                         },
                     ],
                     "err": null,
                     "innerInstructions": null,
                     "loadedAccountsDataSize": loaded_accounts_data_size,
+                    "fee": 5000,
+                    "loadedAddresses": {"readonly": [], "writable": []},
+                    "preBalances": [1000000000, 29300, 1],
+                    "postBalances": [999994999, 29301, 1],
+                    "preTokenBalances": [],
+                    "postTokenBalances": [],
                     "logs":[
                         "Program 11111111111111111111111111111111 invoke [1]",
                         "Program 11111111111111111111111111111111 success"
@@ -6457,6 +6509,12 @@ pub mod tests {
                     "err":null,
                     "innerInstructions": null,
                     "loadedAccountsDataSize": loaded_accounts_data_size,
+                    "fee": 10000,
+                    "loadedAddresses": {"readonly": [], "writable": []},
+                    "preBalances": [1000000000, 0, 1, 0, 1],
+                    "postBalances": [999977200, 12800, 1, 0, 1],
+                    "preTokenBalances": [],
+                    "postTokenBalances": [],
                     "logs":[
                         "Program TestProgram11111111111111111111111111111111 invoke [1]",
                         "I am logging from a builtin program!",
@@ -6500,6 +6558,12 @@ pub mod tests {
                     "err":null,
                     "innerInstructions": null,
                     "loadedAccountsDataSize": loaded_accounts_data_size,
+                    "fee": 10000,
+                    "loadedAddresses": {"readonly": [], "writable": []},
+                    "preBalances": [1000000000, 0, 1, 0, 1],
+                    "postBalances": [999977200, 12800, 1, 0, 1],
+                    "preTokenBalances": [],
+                    "postTokenBalances": [],
                     "logs":[
                         "Program TestProgram11111111111111111111111111111111 invoke [1]",
                         "I am logging from a builtin program!",
@@ -6564,6 +6628,12 @@ pub mod tests {
                         }
                     ],
                     "loadedAccountsDataSize": loaded_accounts_data_size,
+                    "fee": 10000,
+                    "loadedAddresses": {"readonly": [], "writable": []},
+                    "preBalances": [1000000000, 0, 1, 0, 1],
+                    "postBalances": [999977200, 12800, 1, 0, 1],
+                    "preTokenBalances": [],
+                    "postTokenBalances": [],
                     "logs":[
                         "Program TestProgram11111111111111111111111111111111 invoke [1]",
                         "I am logging from a builtin program!",
@@ -6824,7 +6894,7 @@ pub mod tests {
         assert_eq!(
             res,
             Some(
-                r#"{"jsonrpc":"2.0","error":{"code":-32002,"message":"Transaction simulation failed: Blockhash not found","data":{"accounts":null,"err":"BlockhashNotFound","innerInstructions":null,"loadedAccountsDataSize":0,"logs":[],"replacementBlockhash":null,"returnData":null,"unitsConsumed":0}},"id":1}"#.to_string(),
+                r#"{"jsonrpc":"2.0","error":{"code":-32002,"message":"Transaction simulation failed: Blockhash not found","data":{"accounts":null,"err":"BlockhashNotFound","fee":null,"innerInstructions":null,"loadedAccountsDataSize":0,"loadedAddresses":null,"logs":[],"postBalances":null,"postTokenBalances":null,"preBalances":null,"preTokenBalances":null,"replacementBlockhash":null,"returnData":null,"unitsConsumed":0}},"id":1}"#.to_string(),
             )
         );
 
@@ -7575,7 +7645,7 @@ pub mod tests {
 
         // Create a vote account with no stake.
         let alice_vote_keypair = Keypair::new();
-        let alice_vote_state = VoteState::new(
+        let alice_vote_state = VoteStateV3::new(
             &VoteInit {
                 node_pubkey: mint_keypair.pubkey(),
                 authorized_voter: alice_vote_keypair.pubkey(),
@@ -8300,9 +8370,9 @@ pub mod tests {
         }
     }
 
-    #[test_case(spl_token::id(), None, None; "spl_token")]
-    #[test_case(spl_token_2022::id(), Some(InterestBearingConfig { pre_update_average_rate: 500.into(), current_rate: 500.into(),..Default::default() }), None; "spl_token_2022_with _interest")]
-    #[test_case(spl_token_2022::id(), None, Some(ScaledUiAmountConfig { new_multiplier: 2.0f64.into(), ..Default::default() }); "spl-token-2022 with multiplier")]
+    #[test_case(spl_token_interface::id(), None, None; "spl_token")]
+    #[test_case(spl_token_2022_interface::id(), Some(InterestBearingConfig { pre_update_average_rate: 500.into(), current_rate: 500.into(),..Default::default() }), None; "spl_token_2022_with _interest")]
+    #[test_case(spl_token_2022_interface::id(), None, Some(ScaledUiAmountConfig { new_multiplier: 2.0f64.into(), ..Default::default() }); "spl-token-2022 with multiplier")]
     fn test_token_parsing(
         program_id: Pubkey,
         mut interest_bearing_config: Option<InterestBearingConfig>,
@@ -8579,7 +8649,7 @@ pub mod tests {
         let owner = Pubkey::new_unique();
         assert_eq!(
             get_spl_token_owner_filter(
-                &spl_token::id(),
+                &spl_token_interface::id(),
                 &[
                     RpcFilterType::Memcmp(Memcmp::new_raw_bytes(32, owner.to_bytes().to_vec())),
                     RpcFilterType::DataSize(165)
@@ -8811,7 +8881,10 @@ pub mod tests {
         let mut last_notified_confirmed_slot: Slot = 0;
 
         OptimisticallyConfirmedBankTracker::process_notification(
-            BankNotification::OptimisticallyConfirmed(2),
+            (
+                BankNotification::OptimisticallyConfirmed(2),
+                None, /* no work sequence */
+            ),
             &bank_forks,
             &optimistically_confirmed_bank,
             &subscriptions,
@@ -8821,6 +8894,7 @@ pub mod tests {
             &mut highest_root_slot,
             &None,
             &PrioritizationFeeCache::default(),
+            &None, // no dependency tracker
         );
         let req =
             r#"{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment": "confirmed"}]}"#;
@@ -8831,7 +8905,10 @@ pub mod tests {
 
         // Test rollback does not appear to happen, even if slots are notified out of order
         OptimisticallyConfirmedBankTracker::process_notification(
-            BankNotification::OptimisticallyConfirmed(1),
+            (
+                BankNotification::OptimisticallyConfirmed(1),
+                None, /* no work sequence */
+            ),
             &bank_forks,
             &optimistically_confirmed_bank,
             &subscriptions,
@@ -8841,6 +8918,7 @@ pub mod tests {
             &mut highest_root_slot,
             &None,
             &PrioritizationFeeCache::default(),
+            &None, // No dependency tracker
         );
         let req =
             r#"{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment": "confirmed"}]}"#;
@@ -8851,7 +8929,10 @@ pub mod tests {
 
         // Test bank will only be cached when frozen
         OptimisticallyConfirmedBankTracker::process_notification(
-            BankNotification::OptimisticallyConfirmed(3),
+            (
+                BankNotification::OptimisticallyConfirmed(3),
+                None, /* no work sequence */
+            ),
             &bank_forks,
             &optimistically_confirmed_bank,
             &subscriptions,
@@ -8861,6 +8942,7 @@ pub mod tests {
             &mut highest_root_slot,
             &None,
             &PrioritizationFeeCache::default(),
+            &None, // No dependency tracker
         );
         let req =
             r#"{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment": "confirmed"}]}"#;
@@ -8872,7 +8954,10 @@ pub mod tests {
         // Test freezing an optimistically confirmed bank will update cache
         let bank3 = bank_forks.read().unwrap().get(3).unwrap();
         OptimisticallyConfirmedBankTracker::process_notification(
-            BankNotification::Frozen(bank3),
+            (
+                BankNotification::Frozen(bank3),
+                None, /* no work sequence */
+            ),
             &bank_forks,
             &optimistically_confirmed_bank,
             &subscriptions,
@@ -8882,6 +8967,7 @@ pub mod tests {
             &mut highest_root_slot,
             &None,
             &PrioritizationFeeCache::default(),
+            &None, // No dependency tracker
         );
         let req =
             r#"{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment": "confirmed"}]}"#;

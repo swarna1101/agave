@@ -2,6 +2,7 @@ use {
     crate::{accounts_index::AccountsIndexRootsStats, append_vec::APPEND_VEC_STATS},
     solana_time_utils::AtomicInterval,
     std::{
+        iter::Sum,
         num::Saturating,
         sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     },
@@ -9,12 +10,7 @@ use {
 
 #[derive(Debug, Default)]
 pub struct AccountsStats {
-    pub delta_hash_scan_time_total_us: AtomicU64,
-    pub delta_hash_accumulate_time_total_us: AtomicU64,
-    pub delta_hash_num: AtomicU64,
-
     pub last_store_report: AtomicInterval,
-    pub store_hash_accounts: AtomicU64,
     pub store_accounts: AtomicU64,
     pub store_update_index: AtomicU64,
     pub store_handle_reclaims: AtomicU64,
@@ -23,12 +19,14 @@ pub struct AccountsStats {
     pub store_num_accounts: AtomicU64,
     pub store_total_data: AtomicU64,
     pub create_store_count: AtomicU64,
-    pub store_get_slot_store: AtomicU64,
-    pub store_find_existing: AtomicU64,
     pub dropped_stores: AtomicU64,
     pub handle_dead_keys_us: AtomicU64,
     pub purge_exact_us: AtomicU64,
     pub purge_exact_count: AtomicU64,
+    pub num_obsolete_slots_removed: AtomicUsize,
+    pub num_obsolete_bytes_removed: AtomicU64,
+    pub add_zero_lamport_accounts_us: AtomicU64,
+    pub num_zero_lamport_accounts_added: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -761,5 +759,24 @@ impl ShrinkAncientStats {
                 i64
             ),
         );
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ObsoleteAccountsStats {
+    pub accounts_marked_obsolete: u64,
+    pub slots_removed: u64,
+}
+
+impl Sum<Self> for ObsoleteAccountsStats {
+    fn sum<I>(iter: I) -> Self
+    where
+        I: Iterator<Item = Self>,
+    {
+        iter.fold(Self::default(), |mut accumulated_stats, item| {
+            accumulated_stats.accounts_marked_obsolete += item.accounts_marked_obsolete;
+            accumulated_stats.slots_removed += item.slots_removed;
+            accumulated_stats
+        })
     }
 }

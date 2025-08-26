@@ -3,10 +3,6 @@
 
 use {
     crate::{
-        atomic_udp_socket::{
-            AtomicSocketProvider, AtomicUdpSocket, CurrentSocket, FixedSocketProvider,
-            SocketProvider,
-        },
         packet::{
             self, PacketBatch, PacketBatchRecycler, PacketRef, PinnedPacketBatch, PACKETS_PER_BATCH,
         },
@@ -16,6 +12,9 @@ use {
     crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender, TrySendError},
     histogram::Histogram,
     itertools::Itertools,
+    solana_net_utils::multihomed_sockets::{
+        BindIpAddrs, CurrentSocket, FixedSocketProvider, MultihomedSocketProvider, SocketProvider,
+    },
     solana_packet::Packet,
     solana_pubkey::Pubkey,
     solana_time_utils::timestamp,
@@ -182,7 +181,7 @@ fn recv_loop<P: SocketProvider>(
     }
 
     let mut socket = provider.current_socket_ref();
-    setup_socket(&socket)?;
+    setup_socket(socket)?;
     #[cfg(unix)]
     let mut poll_fd = [PollFd::new(socket.as_fd(), PollFlags::POLLIN)];
 
@@ -209,9 +208,9 @@ fn recv_loop<P: SocketProvider>(
             }
 
             #[cfg(unix)]
-            let result = packet::recv_from(&mut packet_batch, &socket, coalesce, &mut poll_fd);
+            let result = packet::recv_from(&mut packet_batch, socket, coalesce, &mut poll_fd);
             #[cfg(not(unix))]
-            let result = packet::recv_from(&mut packet_batch, &socket, coalesce);
+            let result = packet::recv_from(&mut packet_batch, socket, coalesce);
 
             if let Ok(len) = result {
                 if len > 0 {
@@ -248,7 +247,7 @@ fn recv_loop<P: SocketProvider>(
 
         if let CurrentSocket::Changed(s) = provider.current_socket() {
             socket = s;
-            setup_socket(&socket)?;
+            setup_socket(socket)?;
 
             #[cfg(unix)]
             {
@@ -293,7 +292,8 @@ pub fn receiver(
 #[allow(clippy::too_many_arguments)]
 pub fn receiver_atomic(
     thread_name: String,
-    socket: Arc<AtomicUdpSocket>,
+    sockets: Arc<[UdpSocket]>,
+    bind_ip_addrs: Arc<BindIpAddrs>,
     exit: Arc<AtomicBool>,
     packet_batch_sender: impl ChannelSend<PacketBatch>,
     recycler: PacketBatchRecycler,
@@ -306,7 +306,7 @@ pub fn receiver_atomic(
     Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let mut provider = AtomicSocketProvider::new(socket);
+            let mut provider = MultihomedSocketProvider::new(sockets, bind_ip_addrs);
             let _ = recv_loop(
                 &mut provider,
                 &exit,
@@ -536,7 +536,8 @@ pub fn recv_packet_batches(
 
 pub fn responder_atomic(
     name: &'static str,
-    sock: Arc<AtomicUdpSocket>,
+    sockets: Arc<[UdpSocket]>,
+    bind_ip_addrs: Arc<BindIpAddrs>,
     r: PacketBatchReceiver,
     socket_addr_space: SocketAddrSpace,
     stats_reporter_sender: Option<Sender<Box<dyn FnOnce() + Send>>>,
@@ -545,7 +546,7 @@ pub fn responder_atomic(
         .name(format!("solRspndr{name}"))
         .spawn(move || {
             responder_loop(
-                AtomicSocketProvider::new(sock),
+                MultihomedSocketProvider::new(sockets, bind_ip_addrs),
                 name,
                 r,
                 socket_addr_space,
@@ -594,7 +595,7 @@ fn responder_loop<P: SocketProvider>(
 
     loop {
         let sock = provider.current_socket_ref();
-        if let Err(e) = recv_send(&sock, &r, &socket_addr_space, &mut stats) {
+        if let Err(e) = recv_send(sock, &r, &socket_addr_space, &mut stats) {
             match e {
                 StreamerError::RecvTimeout(RecvTimeoutError::Disconnected) => break,
                 StreamerError::RecvTimeout(RecvTimeoutError::Timeout) => (),
@@ -628,11 +629,10 @@ mod test {
             streamer::{receiver, responder},
         },
         crossbeam_channel::unbounded,
-        solana_net_utils::bind_to_localhost,
+        solana_net_utils::sockets::bind_to_localhost_unique,
         solana_perf::recycler::Recycler,
         std::{
-            io,
-            io::Write,
+            io::{self, Write},
             sync::{
                 atomic::{AtomicBool, Ordering},
                 Arc,
@@ -663,11 +663,10 @@ mod test {
     }
     #[test]
     fn streamer_send_test() {
-        let read = bind_to_localhost().expect("bind");
+        let read = bind_to_localhost_unique().expect("should bind reader");
         read.set_read_timeout(Some(SOCKET_READ_TIMEOUT)).unwrap();
-
         let addr = read.local_addr().unwrap();
-        let send = bind_to_localhost().expect("bind");
+        let send = bind_to_localhost_unique().expect("should bind sender");
         let exit = Arc::new(AtomicBool::new(false));
         let (s_reader, r_reader) = unbounded();
         let stats = Arc::new(StreamerReceiveStats::new("test"));

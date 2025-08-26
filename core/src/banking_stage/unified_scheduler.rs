@@ -32,14 +32,17 @@ use {
     super::{
         decision_maker::{BufferedPacketsDecision, DecisionMaker, DecisionMakerWrapper},
         packet_deserializer::PacketDeserializer,
-        LikeClusterInfo,
     },
     crate::banking_trace::Channels,
     agave_banking_stage_ingress_types::BankingPacketBatch,
     solana_poh::{poh_recorder::PohRecorder, transaction_recorder::TransactionRecorder},
-    solana_runtime::{bank_forks::BankForks, root_bank_cache::RootBankCache},
+    solana_runtime::bank_forks::BankForks,
     solana_unified_scheduler_pool::{BankingStageHelper, DefaultSchedulerPool},
-    std::sync::{Arc, RwLock},
+    std::{
+        num::NonZeroUsize,
+        ops::Deref,
+        sync::{Arc, RwLock},
+    },
 };
 
 #[allow(dead_code)]
@@ -48,16 +51,23 @@ pub(crate) fn ensure_banking_stage_setup(
     pool: &DefaultSchedulerPool,
     bank_forks: &Arc<RwLock<BankForks>>,
     channels: &Channels,
-    cluster_info: &impl LikeClusterInfo,
     poh_recorder: &Arc<RwLock<PohRecorder>>,
     transaction_recorder: TransactionRecorder,
-    num_threads: u32,
+    num_threads: NonZeroUsize,
 ) {
-    let mut root_bank_cache = RootBankCache::new(bank_forks.clone());
+    let root_bank = bank_forks.read().unwrap().sharable_root_bank();
     let unified_receiver = channels.unified_receiver().clone();
-    let mut decision_maker = DecisionMaker::new(cluster_info.id(), poh_recorder.clone());
-    let banking_stage_monitor = Box::new(DecisionMakerWrapper::new(decision_maker.clone()));
 
+    let (is_exited, decision_maker) = {
+        let poh_recorder = poh_recorder.read().unwrap();
+        (
+            poh_recorder.is_exited.clone(),
+            DecisionMaker::from(poh_recorder.deref()),
+        )
+    };
+
+    let banking_stage_monitor =
+        Box::new(DecisionMakerWrapper::new(is_exited, decision_maker.clone()));
     let banking_packet_handler = Box::new(
         move |helper: &BankingStageHelper, batches: BankingPacketBatch| {
             let decision = decision_maker.make_consume_or_forward_decision();
@@ -67,13 +77,13 @@ pub(crate) fn ensure_banking_stage_setup(
                 // by solScCleaner.
                 return;
             }
-            let bank = root_bank_cache.root_bank();
+            let bank = root_bank.load();
             for batch in batches.iter() {
                 // over-provision nevertheless some of packets could be invalid.
                 let task_id_base = helper.generate_task_ids(batch.len());
-                let packets = PacketDeserializer::deserialize_packets_with_indexes(batch);
+                let packets = PacketDeserializer::deserialize_packets_for_unified_scheduler(batch);
 
-                for (packet, packet_index) in packets {
+                for (packet, packet_index, packet_size) in packets {
                     let Some((transaction, _deactivation_slot)) = packet
                         .build_sanitized_transaction(
                             bank.vote_only_bank(),
@@ -86,7 +96,7 @@ pub(crate) fn ensure_banking_stage_setup(
 
                     let index = task_id_base + packet_index;
 
-                    let task = helper.create_new_task(transaction, index);
+                    let task = helper.create_new_task(transaction, index, packet_size);
                     helper.send_new_task(task);
                 }
             }
@@ -94,7 +104,7 @@ pub(crate) fn ensure_banking_stage_setup(
     );
 
     pool.register_banking_stage(
-        Some(num_threads.try_into().unwrap()),
+        Some(num_threads.get()),
         unified_receiver,
         banking_packet_handler,
         transaction_recorder,

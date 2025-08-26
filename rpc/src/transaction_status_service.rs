@@ -12,7 +12,10 @@ use {
         blockstore::{Blockstore, BlockstoreError},
         blockstore_processor::{TransactionStatusBatch, TransactionStatusMessage},
     },
-    solana_runtime::bank::{Bank, KeyedRewardsAndNumPartitions},
+    solana_runtime::{
+        bank::{Bank, KeyedRewardsAndNumPartitions},
+        dependency_tracker::DependencyTracker,
+    },
     solana_svm::transaction_commit_result::CommittedTransaction,
     solana_transaction_status::{
         extract_and_fmt_memos, map_inner_instructions, Reward, RewardsAndNumPartitions,
@@ -48,63 +51,65 @@ const TSS_TEST_QUIESCE_SLEEP_TIME_MS: u64 = 50;
 pub struct TransactionStatusService {
     thread_hdl: JoinHandle<()>,
     #[cfg(feature = "dev-context-only-utils")]
-    transaction_status_receiver: Arc<Receiver<TransactionStatusMessage>>,
+    transaction_status_receiver: Receiver<TransactionStatusMessage>,
 }
 
 impl TransactionStatusService {
     const SERVICE_NAME: &str = "TransactionStatusService";
 
     pub fn new(
-        write_transaction_status_receiver: Receiver<TransactionStatusMessage>,
+        transaction_status_receiver: Receiver<TransactionStatusMessage>,
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         enable_rpc_transaction_history: bool,
         transaction_notifier: Option<TransactionNotifierArc>,
         blockstore: Arc<Blockstore>,
         enable_extended_tx_metadata_storage: bool,
+        depenency_tracker: Option<Arc<DependencyTracker>>,
         exit: Arc<AtomicBool>,
     ) -> Self {
-        let transaction_status_receiver = Arc::new(write_transaction_status_receiver);
-        let transaction_status_receiver_handle = Arc::clone(&transaction_status_receiver);
-
         let thread_hdl = Builder::new()
             .name("solTxStatusWrtr".to_string())
-            .spawn(move || {
-                info!("{} has started", Self::SERVICE_NAME);
-                loop {
-                    if exit.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let message = match transaction_status_receiver_handle
-                        .recv_timeout(Duration::from_secs(1))
-                    {
-                        Ok(message) => message,
-                        Err(err @ RecvTimeoutError::Disconnected) => {
-                            info!("{} is stopping because: {err}", Self::SERVICE_NAME);
+            .spawn({
+                let transaction_status_receiver = transaction_status_receiver.clone();
+                move || {
+                    info!("{} has started", Self::SERVICE_NAME);
+                    loop {
+                        if exit.load(Ordering::Relaxed) {
                             break;
                         }
-                        Err(RecvTimeoutError::Timeout) => {
-                            continue;
-                        }
-                    };
 
-                    match Self::write_transaction_status_batch(
-                        message,
-                        &max_complete_transaction_status_slot,
-                        enable_rpc_transaction_history,
-                        transaction_notifier.clone(),
-                        &blockstore,
-                        enable_extended_tx_metadata_storage,
-                    ) {
-                        Ok(_) => {}
-                        Err(err) => {
-                            error!("{} is stopping because: {err}", Self::SERVICE_NAME);
-                            exit.store(true, Ordering::Relaxed);
-                            break;
+                        let message = match transaction_status_receiver
+                            .recv_timeout(Duration::from_secs(1))
+                        {
+                            Ok(message) => message,
+                            Err(err @ RecvTimeoutError::Disconnected) => {
+                                info!("{} is stopping because: {err}", Self::SERVICE_NAME);
+                                break;
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                continue;
+                            }
+                        };
+
+                        match Self::write_transaction_status_batch(
+                            message,
+                            &max_complete_transaction_status_slot,
+                            enable_rpc_transaction_history,
+                            transaction_notifier.clone(),
+                            &blockstore,
+                            enable_extended_tx_metadata_storage,
+                            depenency_tracker.clone(),
+                        ) {
+                            Ok(_) => {}
+                            Err(err) => {
+                                error!("{} is stopping because: {err}", Self::SERVICE_NAME);
+                                exit.store(true, Ordering::Relaxed);
+                                break;
+                            }
                         }
                     }
+                    info!("{} has stopped", Self::SERVICE_NAME);
                 }
-                info!("{} has stopped", Self::SERVICE_NAME);
             })
             .unwrap();
         Self {
@@ -121,17 +126,21 @@ impl TransactionStatusService {
         transaction_notifier: Option<TransactionNotifierArc>,
         blockstore: &Blockstore,
         enable_extended_tx_metadata_storage: bool,
+        dependency_tracker: Option<Arc<DependencyTracker>>,
     ) -> Result<()> {
         match transaction_status_message {
-            TransactionStatusMessage::Batch(TransactionStatusBatch {
-                slot,
-                transactions,
-                commit_results,
-                balances,
-                token_balances,
-                costs,
-                transaction_indexes,
-            }) => {
+            TransactionStatusMessage::Batch((
+                TransactionStatusBatch {
+                    slot,
+                    transactions,
+                    commit_results,
+                    balances,
+                    token_balances,
+                    costs,
+                    transaction_indexes,
+                },
+                work_sequence,
+            )) => {
                 let mut status_and_memos_batch = blockstore.get_write_batch()?;
 
                 for (
@@ -244,6 +253,12 @@ impl TransactionStatusService {
 
                 if enable_rpc_transaction_history {
                     blockstore.write_batch(status_and_memos_batch)?;
+                }
+
+                if let Some(dependency_tracker) = dependency_tracker.as_ref() {
+                    if let Some(work_sequence) = work_sequence {
+                        dependency_tracker.mark_this_and_all_previous_work_processed(work_sequence);
+                    }
                 }
             }
             TransactionStatusMessage::Freeze(bank) => {
@@ -448,6 +463,7 @@ pub(crate) mod tests {
             executed_units: 0,
             fee_details: FeeDetails::default(),
             loaded_account_stats: TransactionLoadedAccountsStats::default(),
+            fee_payer_post_balance: 0,
         });
 
         let balances = TransactionBalancesSet {
@@ -507,11 +523,15 @@ pub(crate) mod tests {
             Some(test_notifier.clone()),
             blockstore,
             false,
+            None, // No work dependency tracker
             exit.clone(),
         );
 
         transaction_status_sender
-            .send(TransactionStatusMessage::Batch(transaction_status_batch))
+            .send(TransactionStatusMessage::Batch((
+                transaction_status_batch,
+                None, /* No work sequence */
+            )))
             .unwrap();
 
         transaction_status_service.quiesce_and_join_for_tests(exit);
@@ -574,6 +594,7 @@ pub(crate) mod tests {
             executed_units: 0,
             fee_details: FeeDetails::default(),
             loaded_account_stats: TransactionLoadedAccountsStats::default(),
+            fee_payer_post_balance: 0,
         });
 
         let balances = TransactionBalancesSet {
@@ -602,6 +623,7 @@ pub(crate) mod tests {
 
         let test_notifier = Arc::new(TestTransactionNotifier::new());
 
+        let dependency_tracker = Arc::new(DependencyTracker::default());
         let exit = Arc::new(AtomicBool::new(false));
         let transaction_status_service = TransactionStatusService::new(
             transaction_status_receiver,
@@ -610,11 +632,15 @@ pub(crate) mod tests {
             Some(test_notifier.clone()),
             blockstore,
             false,
+            Some(dependency_tracker.clone()),
             exit.clone(),
         );
-
+        let work_sequence = 345;
         transaction_status_sender
-            .send(TransactionStatusMessage::Batch(transaction_status_batch))
+            .send(TransactionStatusMessage::Batch((
+                transaction_status_batch,
+                Some(work_sequence),
+            )))
             .unwrap();
         transaction_status_service.quiesce_and_join_for_tests(exit);
         assert_eq!(test_notifier.notifications.len(), 2);

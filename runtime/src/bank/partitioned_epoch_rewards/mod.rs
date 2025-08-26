@@ -9,10 +9,13 @@ use {
         inflation_rewards::points::PointValue, stake_account::StakeAccount,
         stake_history::StakeHistory,
     },
-    solana_account::AccountSharedData,
+    solana_account::{AccountSharedData, ReadableAccount},
     solana_accounts_db::{
-        partitioned_rewards::PartitionedEpochRewardsConfig, stake_rewards::StakeReward,
+        partitioned_rewards::PartitionedEpochRewardsConfig,
+        stake_rewards::StakeReward,
+        storable_accounts::{AccountForStorage, StorableAccounts},
     },
+    solana_clock::Slot,
     solana_pubkey::Pubkey,
     solana_reward_info::RewardInfo,
     solana_stake_interface::state::{Delegation, Stake},
@@ -81,13 +84,57 @@ pub(crate) enum EpochRewardPhase {
 
 #[derive(Debug, Default)]
 pub(super) struct VoteRewardsAccounts {
-    /// reward info for each vote account pubkey.
-    /// This type is used by `update_reward_history()`
-    pub(super) rewards: Vec<(Pubkey, RewardInfo)>,
-    /// account to be stored, corresponds to pubkey in `rewards`
-    pub(super) accounts_to_store: Vec<(Pubkey, AccountSharedData)>,
+    /// accounts with rewards to be stored
+    pub(super) accounts_with_rewards: Vec<(Pubkey, RewardInfo, AccountSharedData)>,
     /// total lamports across all `vote_rewards`
     pub(super) total_vote_rewards_lamports: u64,
+}
+
+/// Wrapper struct to implement StorableAccounts for VoteRewardsAccounts
+pub(super) struct VoteRewardsAccountsStorable<'a> {
+    pub slot: Slot,
+    pub vote_rewards_accounts: &'a VoteRewardsAccounts,
+}
+
+impl<'a> StorableAccounts<'a> for VoteRewardsAccountsStorable<'a> {
+    fn account<Ret>(
+        &self,
+        index: usize,
+        mut callback: impl for<'local> FnMut(AccountForStorage<'local>) -> Ret,
+    ) -> Ret {
+        let (pubkey, _, account) = &self.vote_rewards_accounts.accounts_with_rewards[index];
+        callback((pubkey, account).into())
+    }
+
+    fn is_zero_lamport(&self, index: usize) -> bool {
+        self.vote_rewards_accounts.accounts_with_rewards[index]
+            .2
+            .lamports()
+            == 0
+    }
+
+    fn data_len(&self, index: usize) -> usize {
+        self.vote_rewards_accounts.accounts_with_rewards[index]
+            .2
+            .data()
+            .len()
+    }
+
+    fn pubkey(&self, index: usize) -> &Pubkey {
+        &self.vote_rewards_accounts.accounts_with_rewards[index].0
+    }
+
+    fn slot(&self, _index: usize) -> Slot {
+        self.target_slot()
+    }
+
+    fn target_slot(&self) -> Slot {
+        self.slot
+    }
+
+    fn len(&self) -> usize {
+        self.vote_rewards_accounts.accounts_with_rewards.len()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -274,9 +321,8 @@ mod tests {
         solana_native_token::LAMPORTS_PER_SOL,
         solana_reward_info::RewardType,
         solana_signer::Signer,
-        solana_stake_interface::{error::StakeError, state::StakeStateV2},
+        solana_stake_interface::state::StakeStateV2,
         solana_system_transaction as system_transaction,
-        solana_transaction::Transaction,
         solana_vote::vote_transaction,
         solana_vote_interface::state::{VoteStateVersions, MAX_LOCKOUT_HISTORY},
         solana_vote_program::vote_state::{self, TowerSync},
@@ -454,10 +500,10 @@ mod tests {
                 if let Some(v) = vote_state.as_mut() {
                     vote_state::process_slot_vote_unchecked(v, i as u64)
                 }
-                let versioned = VoteStateVersions::Current(Box::new(vote_state.take().unwrap()));
+                let versioned = VoteStateVersions::V3(Box::new(vote_state.take().unwrap()));
                 vote_state::to(&versioned, &mut vote_account).unwrap();
                 match versioned {
-                    VoteStateVersions::Current(v) => {
+                    VoteStateVersions::V3(v) => {
                         vote_state = Some(*v);
                     }
                     _ => panic!("Has to be of type Current"),
@@ -811,13 +857,9 @@ mod tests {
         }
     }
 
-    /// Test that program execution that attempts to mutate a stake account
-    /// incorrectly should fail during reward period. A credit should succeed,
-    /// but a withdrawal should fail.
+    /// Test that lamports can be sent to stake accounts regardless of rewards period.
     #[test]
-    fn test_program_execution_restricted_for_stake_account_in_reward_period() {
-        use solana_transaction_error::TransactionError::InstructionError;
-
+    fn test_rewards_period_system_transfer() {
         let validator_vote_keypairs = ValidatorVoteKeypairs::new_rand();
         let validator_keypairs = vec![&validator_vote_keypairs];
         let GenesisConfigInfo {
@@ -891,36 +933,6 @@ mod tests {
 
             // Credits should always succeed
             assert!(system_result.is_ok());
-
-            // Attempt to withdraw from new stake account to the mint
-            let stake_ix = solana_stake_interface::instruction::withdraw(
-                &new_stake_address,
-                &new_stake_address,
-                &mint_keypair.pubkey(),
-                transfer_amount,
-                None,
-            );
-            let stake_tx = Transaction::new_signed_with_payer(
-                &[stake_ix],
-                Some(&mint_keypair.pubkey()),
-                &[&mint_keypair, &new_stake_signer],
-                bank.last_blockhash(),
-            );
-            let stake_result = bank.process_transaction(&stake_tx);
-
-            if slot == num_slots_in_epoch {
-                // When the bank is at the beginning of the new epoch, i.e. slot
-                // 32, StakeError::EpochRewardsActive should be thrown for
-                // actions like StakeInstruction::Withdraw
-                assert_eq!(
-                    stake_result,
-                    Err(InstructionError(0, StakeError::EpochRewardsActive.into()))
-                );
-            } else {
-                // When the bank is outside of reward interval, the withdraw
-                // transaction should not be affected and will succeed.
-                assert!(stake_result.is_ok());
-            }
 
             // Push a dummy blockhash, so that the latest_blockhash() for the transfer transaction in each
             // iteration are different. Otherwise, all those transactions will be the same, and will not be

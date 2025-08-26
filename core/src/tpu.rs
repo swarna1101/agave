@@ -1,12 +1,6 @@
 //! The `tpu` module implements the Transaction Processing Unit, a
 //! multi-stage transaction processing pipeline in software.
 
-// allow multiple connections for NAT and any open/close overlap
-#[deprecated(
-    since = "2.2.0",
-    note = "Use solana_streamer::quic::DEFAULT_MAX_QUIC_CONNECTIONS_PER_PEER instead"
-)]
-pub use solana_streamer::quic::DEFAULT_MAX_QUIC_CONNECTIONS_PER_PEER as MAX_QUIC_CONNECTIONS_PER_PEER;
 pub use {
     crate::forwarding_stage::ForwardingClientOption, solana_streamer::quic::DEFAULT_TPU_COALESCE,
 };
@@ -46,17 +40,16 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_rpc::{
-        optimistically_confirmed_bank_tracker::BankNotificationSender,
+        optimistically_confirmed_bank_tracker::BankNotificationSenderConfig,
         rpc_subscriptions::RpcSubscriptions,
     },
     solana_runtime::{
         bank_forks::BankForks,
         prioritization_fee_cache::PrioritizationFeeCache,
-        root_bank_cache::RootBankCache,
         vote_sender_types::{ReplayVoteReceiver, ReplayVoteSender},
     },
     solana_streamer::{
-        quic::{spawn_server_multi, QuicServerParams, SpawnServerResult},
+        quic::{spawn_server, QuicServerParams, SpawnServerResult},
         streamer::StakedNodes,
     },
     solana_turbine::{
@@ -66,6 +59,7 @@ use {
     std::{
         collections::HashMap,
         net::{SocketAddr, UdpSocket},
+        num::NonZeroUsize,
         sync::{atomic::AtomicBool, Arc, RwLock},
         thread::{self, JoinHandle},
         time::Duration,
@@ -105,7 +99,7 @@ pub struct Tpu {
     fetch_stage: FetchStage,
     sig_verifier: SigVerifier,
     vote_sigverify_stage: SigVerifyStage,
-    banking_stage: BankingStage,
+    banking_stage: Arc<RwLock<Option<BankingStage>>>,
     forwarding_stage: JoinHandle<()>,
     cluster_info_vote_listener: ClusterInfoVoteListener,
     broadcast_stage: BroadcastStage,
@@ -140,7 +134,7 @@ impl Tpu {
         gossip_verified_vote_hash_sender: GossipVerifiedVoteHashSender,
         replay_vote_receiver: ReplayVoteReceiver,
         replay_vote_sender: ReplayVoteSender,
-        bank_notification_sender: Option<BankNotificationSender>,
+        bank_notification_sender: Option<BankNotificationSenderConfig>,
         tpu_coalesce: Duration,
         duplicate_confirmed_slot_sender: DuplicateConfirmedSlotsSender,
         client: ForwardingClientOption,
@@ -157,6 +151,7 @@ impl Tpu {
         vote_quic_server_config: QuicServerParams,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
         block_production_method: BlockProductionMethod,
+        block_production_num_workers: NonZeroUsize,
         transaction_struct: TransactionStructure,
         enable_block_production_forwarding: bool,
         _generator_config: Option<GeneratorConfig>, /* vestigial code for replay invalidator */
@@ -213,7 +208,7 @@ impl Tpu {
             endpoints: _,
             thread: tpu_vote_quic_t,
             key_updater: vote_streamer_key_updater,
-        } = spawn_server_multi(
+        } = spawn_server(
             "solQuicTVo",
             "quic_streamer_tpu_vote",
             tpu_vote_quic_sockets,
@@ -231,7 +226,7 @@ impl Tpu {
                 endpoints: _,
                 thread: tpu_quic_t,
                 key_updater,
-            } = spawn_server_multi(
+            } = spawn_server(
                 "solQuicTpu",
                 "quic_streamer_tpu",
                 transactions_quic_sockets,
@@ -253,7 +248,7 @@ impl Tpu {
                 endpoints: _,
                 thread: tpu_forwards_quic_t,
                 key_updater: forwards_key_updater,
-            } = spawn_server_multi(
+            } = spawn_server(
                 "solQuicTpuFwd",
                 "quic_streamer_tpu_forwards",
                 transactions_forwards_quic_sockets,
@@ -324,20 +319,20 @@ impl Tpu {
             duplicate_confirmed_slot_sender,
         );
 
-        let banking_stage = BankingStage::new(
+        let banking_stage = BankingStage::new_num_threads(
             block_production_method,
             transaction_struct,
-            cluster_info,
-            poh_recorder,
+            poh_recorder.clone(),
             transaction_recorder,
             non_vote_receiver,
             tpu_vote_receiver,
             gossip_vote_receiver,
+            block_production_num_workers,
             transaction_status_sender,
             replay_vote_sender,
             log_messages_bytes_limit,
             bank_forks.clone(),
-            prioritization_fee_cache,
+            prioritization_fee_cache.clone(),
         );
 
         let SpawnForwardingStageResult {
@@ -347,7 +342,7 @@ impl Tpu {
             forward_stage_receiver,
             client,
             vote_forwarding_client_socket,
-            RootBankCache::new(bank_forks.clone()),
+            bank_forks.read().unwrap().sharable_root_bank(),
             ForwardAddressGetter::new(cluster_info.clone(), poh_recorder.clone()),
             DataBudget::default(),
         );
@@ -394,7 +389,7 @@ impl Tpu {
             fetch_stage,
             sig_verifier,
             vote_sigverify_stage,
-            banking_stage,
+            banking_stage: Arc::new(RwLock::new(Some(banking_stage))),
             forwarding_stage,
             cluster_info_vote_listener,
             broadcast_stage,
@@ -407,13 +402,22 @@ impl Tpu {
         }
     }
 
+    pub fn banking_stage(&self) -> Arc<RwLock<Option<BankingStage>>> {
+        self.banking_stage.clone()
+    }
+
     pub fn join(self) -> thread::Result<()> {
         let results = vec![
             self.fetch_stage.join(),
             self.sig_verifier.join(),
             self.vote_sigverify_stage.join(),
             self.cluster_info_vote_listener.join(),
-            self.banking_stage.join(),
+            self.banking_stage
+                .write()
+                .unwrap()
+                .take()
+                .expect("banking_stage must be Some")
+                .join(),
             self.forwarding_stage.join(),
             self.staked_nodes_updater_service.join(),
             self.tpu_quic_t.map_or(Ok(()), |t| t.join()),
