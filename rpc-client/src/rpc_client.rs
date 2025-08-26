@@ -4332,8 +4332,8 @@ mod tests {
         let v0_serialized = v0_message.serialize_message();
         
         // Test that the serializations are different lengths due to version prefix
-        assert!(legacy_serialized.len() > 0, "Legacy message should serialize to non-empty data");
-        assert!(v0_serialized.len() > 0, "V0 message should serialize to non-empty data");
+        assert!(!legacy_serialized.is_empty(), "Legacy message should serialize to non-empty data");
+        assert!(!v0_serialized.is_empty(), "V0 message should serialize to non-empty data");
         
         // Test that v0 message serialization includes the version prefix (0x80)
         // The first byte should have the MESSAGE_VERSION_PREFIX (0x80) set for v0 messages
@@ -4349,8 +4349,8 @@ mod tests {
         let legacy_base64 = BASE64_STANDARD.encode(&legacy_serialized);
         let v0_base64 = BASE64_STANDARD.encode(&v0_serialized);
         
-        assert!(legacy_base64.len() > 0, "Legacy base64 should not be empty");
-        assert!(v0_base64.len() > 0, "V0 base64 should not be empty");
+        assert!(!legacy_base64.is_empty(), "Legacy base64 should not be empty");
+        assert!(!v0_base64.is_empty(), "V0 base64 should not be empty");
         
         // Verify that the two serializations are indeed different
         assert_ne!(legacy_serialized, v0_serialized, "Legacy and V0 serializations should be different");
