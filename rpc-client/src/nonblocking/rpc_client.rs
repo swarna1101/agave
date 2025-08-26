@@ -4671,7 +4671,7 @@ impl RpcClient {
         &self,
         message: &impl SerializableMessage,
     ) -> ClientResult<u64> {
-        let serialized_encoded = serialize_and_encode(message, UiTransactionEncoding::Base64)?;
+        let serialized_encoded = serialize_and_encode_message(message, UiTransactionEncoding::Base64)?;
         let result = self
             .send::<Response<Option<u64>>>(
                 RpcRequest::GetFeeForMessage,
@@ -4733,6 +4733,24 @@ where
 {
     let serialized = serialize(input)
         .map_err(|e| ClientErrorKind::Custom(format!("Serialization failed: {e}")))?;
+    let encoded = match encoding {
+        UiTransactionEncoding::Base58 => bs58::encode(serialized).into_string(),
+        UiTransactionEncoding::Base64 => BASE64_STANDARD.encode(serialized),
+        _ => {
+            return Err(ClientErrorKind::Custom(format!(
+                "unsupported encoding: {encoding}. Supported encodings: base58, base64"
+            ))
+            .into())
+        }
+    };
+    Ok(encoded)
+}
+
+fn serialize_and_encode_message(
+    message: &impl SerializableMessage,
+    encoding: UiTransactionEncoding,
+) -> ClientResult<String> {
+    let serialized = message.serialize_message();
     let encoded = match encoding {
         UiTransactionEncoding::Base58 => bs58::encode(serialized).into_string(),
         UiTransactionEncoding::Base64 => BASE64_STANDARD.encode(serialized),

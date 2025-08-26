@@ -62,9 +62,21 @@ impl RpcClientConfig {
 
 /// Trait used to add support for versioned messages to RPC APIs while
 /// retaining backwards compatibility
-pub trait SerializableMessage: Serialize {}
-impl SerializableMessage for LegacyMessage {}
-impl SerializableMessage for v0::Message {}
+pub trait SerializableMessage: Serialize {
+    /// Serialize the message using the appropriate method for the message type.
+    /// For versioned messages, this includes the MESSAGE_VERSION_PREFIX.
+    fn serialize_message(&self) -> Vec<u8>;
+}
+impl SerializableMessage for LegacyMessage {
+    fn serialize_message(&self) -> Vec<u8> {
+        self.serialize()
+    }
+}
+impl SerializableMessage for v0::Message {
+    fn serialize_message(&self) -> Vec<u8> {
+        self.serialize()
+    }
+}
 
 /// Trait used to add support for versioned transactions to RPC APIs while
 /// retaining backwards compatibility
@@ -3797,14 +3809,22 @@ mod tests {
         super::*,
         crate::mock_sender::PUBKEY,
         assert_matches::assert_matches,
+        base64::{prelude::BASE64_STANDARD, Engine},
         crossbeam_channel::unbounded,
         jsonrpc_core::{futures::prelude::*, Error, IoHandler, Params},
         jsonrpc_http_server::{AccessControlAllowOrigin, DomainsValidation, ServerBuilder},
         serde_json::{json, Number},
         solana_account_decoder::encode_ui_account,
         solana_account_decoder_client_types::UiAccountEncoding,
+        solana_hash::Hash,
         solana_instruction::error::InstructionError,
         solana_keypair::Keypair,
+        solana_message::{
+            v0::{self, MessageAddressTableLookup},
+            Message as LegacyMessage,
+            MessageHeader,
+            compiled_instruction::CompiledInstruction,
+        },
         solana_rpc_client_api::client_error::ErrorKind,
         solana_signer::Signer,
         solana_system_transaction as system_transaction,
@@ -4253,5 +4273,146 @@ mod tests {
             result1.extend(result_3);
             assert_eq!(expected_result, result1);
         }
+    }
+
+    #[test]
+    fn test_versioned_message_serialization_includes_prefix() {
+        // Test that v0::Message serialization includes MESSAGE_VERSION_PREFIX
+        // while LegacyMessage does not
+        
+        let program_id = Pubkey::new_unique();
+        let account_key = Pubkey::new_unique();
+        let recent_blockhash = Hash::new_unique();
+        
+        // Create a legacy message
+        let legacy_message = LegacyMessage {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![account_key, program_id],
+            recent_blockhash,
+            instructions: vec![
+                CompiledInstruction {
+                    program_id_index: 1,
+                    accounts: vec![0],
+                    data: vec![1, 2, 3],
+                }
+            ],
+        };
+        
+        // Create a v0 message with address table lookups
+        let v0_message = v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![account_key],
+            recent_blockhash,
+            instructions: vec![
+                CompiledInstruction {
+                    program_id_index: 0,
+                    accounts: vec![],
+                    data: vec![1, 2, 3],
+                }
+            ],
+            address_table_lookups: vec![
+                MessageAddressTableLookup {
+                    account_key: program_id,
+                    writable_indexes: vec![],
+                    readonly_indexes: vec![0],
+                }
+            ],
+        };
+        
+        // Test that both messages can be serialized using our new trait method
+        let legacy_serialized = legacy_message.serialize_message();
+        let v0_serialized = v0_message.serialize_message();
+        
+        // Test that the serializations are different lengths due to version prefix
+        assert!(legacy_serialized.len() > 0, "Legacy message should serialize to non-empty data");
+        assert!(v0_serialized.len() > 0, "V0 message should serialize to non-empty data");
+        
+        // Test that v0 message serialization includes the version prefix (0x80)
+        // The first byte should have the MESSAGE_VERSION_PREFIX (0x80) set for v0 messages
+        const MESSAGE_VERSION_PREFIX: u8 = 0x80;
+        assert_eq!(v0_serialized[0] & MESSAGE_VERSION_PREFIX, MESSAGE_VERSION_PREFIX, 
+            "V0 message should have version prefix in first byte");
+        
+        // Legacy messages should not have the version prefix
+        assert_eq!(legacy_serialized[0] & MESSAGE_VERSION_PREFIX, 0, 
+            "Legacy message should not have version prefix");
+        
+        // Test base64 encoding matches expected format
+        let legacy_base64 = BASE64_STANDARD.encode(&legacy_serialized);
+        let v0_base64 = BASE64_STANDARD.encode(&v0_serialized);
+        
+        assert!(legacy_base64.len() > 0, "Legacy base64 should not be empty");
+        assert!(v0_base64.len() > 0, "V0 base64 should not be empty");
+        
+        // Verify that the two serializations are indeed different
+        assert_ne!(legacy_serialized, v0_serialized, "Legacy and V0 serializations should be different");
+        assert_ne!(legacy_base64, v0_base64, "Legacy and V0 base64 encodings should be different");
+    }
+
+    #[test]
+    fn test_message_serialization_compatibility() {
+        // Test that our serialize_message method produces the same output as
+        // the direct .serialize() method call on the message types
+        
+        let account_key = Pubkey::new_unique();
+        let program_id = Pubkey::new_unique();
+        let recent_blockhash = Hash::new_unique();
+        
+        // Test legacy message
+        let legacy_message = LegacyMessage {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![account_key, program_id],
+            recent_blockhash,
+            instructions: vec![
+                CompiledInstruction {
+                    program_id_index: 1,
+                    accounts: vec![0],
+                    data: vec![],
+                }
+            ],
+        };
+        
+        let trait_serialized = legacy_message.serialize_message();
+        let direct_serialized = legacy_message.serialize();
+        
+        assert_eq!(trait_serialized, direct_serialized, 
+            "SerializableMessage::serialize_message should match direct Message::serialize for legacy messages");
+        
+        // Test v0 message  
+        let v0_message = v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            account_keys: vec![account_key],
+            recent_blockhash,
+            instructions: vec![
+                CompiledInstruction {
+                    program_id_index: 0,
+                    accounts: vec![],
+                    data: vec![],
+                }
+            ],
+            address_table_lookups: vec![],
+        };
+        
+        let trait_serialized = v0_message.serialize_message();
+        let direct_serialized = v0_message.serialize();
+        
+        assert_eq!(trait_serialized, direct_serialized, 
+            "SerializableMessage::serialize_message should match direct Message::serialize for v0 messages");
     }
 }
