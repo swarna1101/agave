@@ -44,7 +44,7 @@ use {
         blockstore::{Blockstore, BlockstoreError, SignatureInfosForAddress},
         blockstore_meta::{PerfSample, PerfSampleV1, PerfSampleV2},
         leader_schedule_cache::LeaderScheduleCache,
-        leader_schedule_utils::leader_schedule,
+        leader_schedule_utils::{self, leader_schedule},
     },
     solana_message::{AddressLoader, SanitizedMessage},
     solana_metrics::inc_new_counter_info,
@@ -5570,7 +5570,7 @@ pub mod tests {
         let current_epoch = bank.epoch();
 
         // Verify we can compute leader schedules using the utility function
-        let computed_schedule = leader_schedule_utils::leader_schedule(current_epoch, &bank);
+        let computed_schedule = leader_schedule(current_epoch, &bank);
         assert!(computed_schedule.is_some(), "Should be able to compute current epoch schedule");
 
         // Test the actual fix logic: cache miss falls back to computation
@@ -5580,8 +5580,8 @@ pub mod tests {
             Some(leader_schedule)
         } else {
             // This is the new fallback logic added to get_slot_leaders
-            leader_schedule_utils::leader_schedule(current_epoch, &bank)
-                .map(std::sync::Arc::new)
+            leader_schedule(current_epoch, &bank)
+                .map(Arc::new)
         };
 
         assert!(leader_schedule.is_some(), "Fix should provide leader schedule");
