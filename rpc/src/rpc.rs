@@ -44,7 +44,7 @@ use {
         blockstore::{Blockstore, BlockstoreError, SignatureInfosForAddress},
         blockstore_meta::{PerfSample, PerfSampleV1, PerfSampleV2},
         leader_schedule_cache::LeaderScheduleCache,
-        leader_schedule_utils,
+        leader_schedule_utils::{self, leader_schedule},
     },
     solana_message::{AddressLoader, SanitizedMessage},
     solana_metrics::inc_new_counter_info,
@@ -994,7 +994,7 @@ impl JsonRpcRequestProcessor {
                 Some(leader_schedule)
             } else {
                 // If not in cache, try to compute it if the epoch's stake information is available
-                leader_schedule_utils::leader_schedule(epoch, &bank)
+                leader_schedule(epoch, &bank)
                     .map(Arc::new)
             };
 
