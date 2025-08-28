@@ -5568,14 +5568,14 @@ pub mod tests {
         let rpc = RpcHandler::start();
         let bank = rpc.working_bank();
         let current_epoch = bank.epoch();
-        
+
         // Verify we can compute leader schedules using the utility function
         let computed_schedule = leader_schedule_utils::leader_schedule(current_epoch, &bank);
         assert!(computed_schedule.is_some(), "Should be able to compute current epoch schedule");
-        
+
         // Test the actual fix logic: cache miss falls back to computation
         let leader_schedule = if let Some(leader_schedule) =
-            rpc.leader_schedule_cache.get_epoch_leader_schedule(current_epoch)
+            rpc.meta.leader_schedule_cache.get_epoch_leader_schedule(current_epoch)
         {
             Some(leader_schedule)
         } else {
@@ -5583,7 +5583,7 @@ pub mod tests {
             leader_schedule_utils::leader_schedule(current_epoch, &bank)
                 .map(std::sync::Arc::new)
         };
-        
+
         assert!(leader_schedule.is_some(), "Fix should provide leader schedule");
         if let Some(schedule) = leader_schedule {
             assert!(!schedule.get_slot_leaders().is_empty(), "Should have leaders");
