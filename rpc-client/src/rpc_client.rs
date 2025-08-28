@@ -60,8 +60,6 @@ impl RpcClientConfig {
     }
 }
 
-
-
 /// Trait used to add support for versioned transactions to RPC APIs while
 /// retaining backwards compatibility
 pub trait SerializableTransaction: Serialize {
@@ -3804,10 +3802,9 @@ mod tests {
         solana_instruction::error::InstructionError,
         solana_keypair::Keypair,
         solana_message::{
-            v0::{self, MessageAddressTableLookup},
-            Message as LegacyMessage,
-            MessageHeader,
             compiled_instruction::CompiledInstruction,
+            v0::{self, MessageAddressTableLookup},
+            Message as LegacyMessage, MessageHeader,
         },
         solana_rpc_client_api::client_error::ErrorKind,
         solana_signer::Signer,
@@ -4259,13 +4256,10 @@ mod tests {
         }
     }
 
+    // Test that VersionedMessage serialization includes MESSAGE_VERSION_PREFIX
+    // for v0 messages but not for legacy messages
     #[test]
     fn test_versioned_message_serialization_includes_prefix() {
-        use solana_message::{v0, Message as LegacyMessage, compiled_instruction::CompiledInstruction, v0::MessageAddressTableLookup, MessageHeader};
-
-        // Test that VersionedMessage serialization includes MESSAGE_VERSION_PREFIX
-        // for v0 messages but not for legacy messages
-
         let program_id = Pubkey::new_unique();
         let account_key = Pubkey::new_unique();
         let recent_blockhash = Hash::new_unique();
@@ -4279,13 +4273,11 @@ mod tests {
             },
             account_keys: vec![account_key, program_id],
             recent_blockhash,
-            instructions: vec![
-                CompiledInstruction {
-                    program_id_index: 1,
-                    accounts: vec![0],
-                    data: vec![1, 2, 3],
-                }
-            ],
+            instructions: vec![CompiledInstruction {
+                program_id_index: 1,
+                accounts: vec![0],
+                data: vec![1, 2, 3],
+            }],
         });
 
         // Create a v0 message wrapped in VersionedMessage
@@ -4297,20 +4289,16 @@ mod tests {
             },
             account_keys: vec![account_key],
             recent_blockhash,
-            instructions: vec![
-                CompiledInstruction {
-                    program_id_index: 0,
-                    accounts: vec![],
-                    data: vec![1, 2, 3],
-                }
-            ],
-            address_table_lookups: vec![
-                MessageAddressTableLookup {
-                    account_key: program_id,
-                    writable_indexes: vec![],
-                    readonly_indexes: vec![0],
-                }
-            ],
+            instructions: vec![CompiledInstruction {
+                program_id_index: 0,
+                accounts: vec![],
+                data: vec![1, 2, 3],
+            }],
+            address_table_lookups: vec![MessageAddressTableLookup {
+                account_key: program_id,
+                writable_indexes: vec![],
+                readonly_indexes: vec![0],
+            }],
         });
 
         // Test that both messages can be serialized using bincode
@@ -4318,37 +4306,55 @@ mod tests {
         let v0_serialized = bincode::serialize(&v0_versioned_message).unwrap();
 
         // Test that the serializations are different lengths due to version prefix
-        assert!(!legacy_serialized.is_empty(), "Legacy message should serialize to non-empty data");
-        assert!(!v0_serialized.is_empty(), "V0 message should serialize to non-empty data");
+        assert!(
+            !legacy_serialized.is_empty(),
+            "Legacy message should serialize to non-empty data"
+        );
+        assert!(
+            !v0_serialized.is_empty(),
+            "V0 message should serialize to non-empty data"
+        );
 
         // Test that v0 message serialization includes the version prefix (0x80)
         // The first byte should have the MESSAGE_VERSION_PREFIX (0x80) set for v0 messages
         const MESSAGE_VERSION_PREFIX: u8 = 0x80;
-        assert_eq!(v0_serialized[0] & MESSAGE_VERSION_PREFIX, MESSAGE_VERSION_PREFIX,
-            "V0 message should have version prefix in first byte");
+        assert_eq!(
+            v0_serialized[0] & MESSAGE_VERSION_PREFIX,
+            MESSAGE_VERSION_PREFIX,
+            "V0 message should have version prefix in first byte"
+        );
 
         // Legacy messages should not have the version prefix
-        assert_eq!(legacy_serialized[0] & MESSAGE_VERSION_PREFIX, 0,
-            "Legacy message should not have version prefix");
+        assert_eq!(
+            legacy_serialized[0] & MESSAGE_VERSION_PREFIX,
+            0,
+            "Legacy message should not have version prefix"
+        );
 
         // Test base64 encoding matches expected format
         let legacy_base64 = BASE64_STANDARD.encode(&legacy_serialized);
         let v0_base64 = BASE64_STANDARD.encode(&v0_serialized);
 
-        assert!(!legacy_base64.is_empty(), "Legacy base64 should not be empty");
+        assert!(
+            !legacy_base64.is_empty(),
+            "Legacy base64 should not be empty"
+        );
         assert!(!v0_base64.is_empty(), "V0 base64 should not be empty");
         // Verify that the two serializations are indeed different
-        assert_ne!(legacy_serialized, v0_serialized, "Legacy and V0 serializations should be different");
-        assert_ne!(legacy_base64, v0_base64, "Legacy and V0 base64 encodings should be different");
+        assert_ne!(
+            legacy_serialized, v0_serialized,
+            "Legacy and V0 serializations should be different"
+        );
+        assert_ne!(
+            legacy_base64, v0_base64,
+            "Legacy and V0 base64 encodings should be different"
+        );
     }
 
+    // Test that VersionedMessage serialization works correctly and includes
+    // the proper version prefix for v0 messages
     #[test]
     fn test_versioned_message_serialization_compatibility() {
-        use solana_message::{v0, Message as LegacyMessage, compiled_instruction::CompiledInstruction, MessageHeader};
-
-        // Test that VersionedMessage serialization works correctly and includes
-        // the proper version prefix for v0 messages
-
         let account_key = Pubkey::new_unique();
         let program_id = Pubkey::new_unique();
         let recent_blockhash = Hash::new_unique();
@@ -4362,17 +4368,18 @@ mod tests {
             },
             account_keys: vec![account_key, program_id],
             recent_blockhash,
-            instructions: vec![
-                CompiledInstruction {
-                    program_id_index: 1,
-                    accounts: vec![0],
-                    data: vec![],
-                }
-            ],
+            instructions: vec![CompiledInstruction {
+                program_id_index: 1,
+                accounts: vec![0],
+                data: vec![],
+            }],
         });
 
         let legacy_serialized = bincode::serialize(&legacy_versioned_message).unwrap();
-        assert!(!legacy_serialized.is_empty(), "Legacy VersionedMessage should serialize to non-empty data");
+        assert!(
+            !legacy_serialized.is_empty(),
+            "Legacy VersionedMessage should serialize to non-empty data"
+        );
 
         // Test v0 message in VersionedMessage
         let v0_versioned_message = VersionedMessage::V0(v0::Message {
@@ -4383,20 +4390,24 @@ mod tests {
             },
             account_keys: vec![account_key],
             recent_blockhash,
-            instructions: vec![
-                CompiledInstruction {
-                    program_id_index: 0,
-                    accounts: vec![],
-                    data: vec![],
-                }
-            ],
+            instructions: vec![CompiledInstruction {
+                program_id_index: 0,
+                accounts: vec![],
+                data: vec![],
+            }],
             address_table_lookups: vec![],
         });
 
         let v0_serialized = bincode::serialize(&v0_versioned_message).unwrap();
-        assert!(!v0_serialized.is_empty(), "V0 VersionedMessage should serialize to non-empty data");
+        assert!(
+            !v0_serialized.is_empty(),
+            "V0 VersionedMessage should serialize to non-empty data"
+        );
 
         // Test that serializations are different (v0 should have version prefix)
-        assert_ne!(legacy_serialized, v0_serialized, "Legacy and V0 VersionedMessage serializations should be different");
+        assert_ne!(
+            legacy_serialized, v0_serialized,
+            "Legacy and V0 VersionedMessage serializations should be different"
+        );
     }
 }
