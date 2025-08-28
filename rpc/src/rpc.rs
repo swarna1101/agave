@@ -995,7 +995,7 @@ impl JsonRpcRequestProcessor {
             } else {
                 // If not in cache, try to compute it if the epoch's stake information is available
                 leader_schedule_utils::leader_schedule(epoch, &bank)
-                    .map(std::sync::Arc::new)
+                    .map(Arc::new)
             };
 
             if let Some(leader_schedule) = leader_schedule {
