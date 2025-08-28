@@ -44,7 +44,7 @@ use {
         blockstore::{Blockstore, BlockstoreError, SignatureInfosForAddress},
         blockstore_meta::{PerfSample, PerfSampleV1, PerfSampleV2},
         leader_schedule_cache::LeaderScheduleCache,
-        leader_schedule_utils::{self, leader_schedule},
+        leader_schedule_utils::leader_schedule,
     },
     solana_message::{AddressLoader, SanitizedMessage},
     solana_metrics::inc_new_counter_info,
