@@ -14,8 +14,7 @@ use {
         http_sender::HttpSender,
         mock_sender::{mock_encoded_account, MockSender, MocksMap},
         rpc_client::{
-            GetConfirmedSignaturesForAddress2Config, RpcClientConfig, SerializableMessage,
-            SerializableTransaction,
+            GetConfirmedSignaturesForAddress2Config, RpcClientConfig, SerializableTransaction,
         },
         rpc_sender::*,
     },
@@ -34,6 +33,7 @@ use {
     solana_epoch_info::EpochInfo,
     solana_epoch_schedule::EpochSchedule,
     solana_hash::Hash,
+    solana_message::VersionedMessage,
     solana_pubkey::Pubkey,
     solana_rpc_client_api::{
         client_error::{
@@ -4669,9 +4669,9 @@ impl RpcClient {
 
     pub async fn get_fee_for_message(
         &self,
-        message: &impl SerializableMessage,
+        message: &VersionedMessage,
     ) -> ClientResult<u64> {
-        let serialized_encoded = serialize_and_encode_message(message, UiTransactionEncoding::Base64)?;
+        let serialized_encoded = serialize_and_encode_versioned_message(message, UiTransactionEncoding::Base64)?;
         let result = self
             .send::<Response<Option<u64>>>(
                 RpcRequest::GetFeeForMessage,
@@ -4746,11 +4746,12 @@ where
     Ok(encoded)
 }
 
-fn serialize_and_encode_message(
-    message: &impl SerializableMessage,
+fn serialize_and_encode_versioned_message(
+    message: &VersionedMessage,
     encoding: UiTransactionEncoding,
 ) -> ClientResult<String> {
-    let serialized = message.serialize_message();
+    let serialized = serialize(message)
+        .map_err(|e| ClientErrorKind::Custom(format!("Serialization failed: {e}")))?;
     let encoded = match encoding {
         UiTransactionEncoding::Base58 => bs58::encode(serialized).into_string(),
         UiTransactionEncoding::Base64 => BASE64_STANDARD.encode(serialized),
