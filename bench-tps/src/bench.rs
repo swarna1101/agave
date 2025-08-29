@@ -1173,7 +1173,9 @@ pub fn fund_keypairs<T: 'static + TpsClient + Send + Sync + ?Sized>(
             None,
             &client.get_latest_blockhash().unwrap(),
         );
-        let max_fee = client.get_fee_for_message(&single_sig_message).unwrap();
+        let max_fee = client
+            .get_fee_for_message_with_legacy(&single_sig_message)
+            .unwrap();
         let extra_fees = extra * max_fee;
         let total_keypairs = keypairs.len() as u64 + 1; // Add one for funding keypair
         let total = lamports_per_account * total_keypairs + extra_fees;

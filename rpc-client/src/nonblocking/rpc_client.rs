@@ -33,7 +33,7 @@ use {
     solana_epoch_info::EpochInfo,
     solana_epoch_schedule::EpochSchedule,
     solana_hash::Hash,
-    solana_message::VersionedMessage,
+    solana_message::{Message, VersionedMessage},
     solana_pubkey::Pubkey,
     solana_rpc_client_api::{
         client_error::{
@@ -4678,6 +4678,11 @@ impl RpcClient {
         result
             .value
             .ok_or_else(|| ClientErrorKind::Custom("Invalid blockhash".to_string()).into())
+    }
+
+    pub async fn get_fee_for_message_with_legacy(&self, message: &Message) -> ClientResult<u64> {
+        let versioned_message = VersionedMessage::Legacy(message.clone());
+        self.get_fee_for_message(&versioned_message).await
     }
 
     pub async fn get_new_latest_blockhash(&self, blockhash: &Hash) -> ClientResult<Hash> {
